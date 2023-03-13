@@ -16,15 +16,20 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: Build and install zlib
+    - name: Download zlib build script
       run: |
         powershell -Command "(Invoke-WebRequest -Uri https://raw.githubusercontent.com/r4sas/zlib.install/master/install.bat -OutFile install_zlib.bat)"
         powershell -Command "(Get-Content install_zlib.bat) | Set-Content install_zlib.bat" # fixing line endings
-        set BUILD_TYPE=Debug
-        ./install_zlib.bat
-        set BUILD_TYPE=Release
-        ./install_zlib.bat
-        del install_zlib.bat
+
+    - name: Build zlib (Debug)
+      env:
+        BUILD_TYPE: Debug
+      run: .\install_zlib.bat
+
+    - name: Build zlib (Release)
+      env:
+        BUILD_TYPE: Release
+      run: .\install_zlib.bat
 
     - name: Install Boost
       uses: crazy-max/ghaction-chocolatey@v2
