@@ -716,6 +716,7 @@ namespace transport
 					if (transport == i2p::data::RouterInfo::eNTCP2V4 || 
 						transport == i2p::data::RouterInfo::eNTCP2V6 || transport == i2p::data::RouterInfo::eNTCP2V6Mesh)
 						it->second.router->GetProfile ()->Connected (); // outgoing NTCP2 connection if always real
+					i2p::data::netdb.SetUnreachable (ident, false); // clear unreachable 
 				}		
 				it->second.numAttempts = 0;
 				it->second.router = nullptr; // we don't need RouterInfo after successive connect
@@ -861,7 +862,9 @@ namespace transport
 			uint16_t inds[3];
 			RAND_bytes ((uint8_t *)inds, sizeof (inds));
 			std::unique_lock<std::mutex> l(m_PeersMutex);
-			inds[0] %= m_Peers.size ();
+			auto count = m_Peers.size ();
+			if(count == 0) return nullptr;
+			inds[0] %= count;
 			auto it = m_Peers.begin ();
 			std::advance (it, inds[0]);
 			// try random peer

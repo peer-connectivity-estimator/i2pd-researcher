@@ -983,7 +983,7 @@ namespace transport
 	void SSU2Server::UpdateIntroducers (bool v4)
 	{
 		uint32_t ts = i2p::util::GetSecondsSinceEpoch ();
-		std::list<i2p::data::IdentHash> newList;
+		std::list<i2p::data::IdentHash> newList, impliedList;
 		auto& introducers = v4 ? m_Introducers : m_IntroducersV6;
 		std::set<i2p::data::IdentHash> excluded;
 		for (const auto& it : introducers)
@@ -998,9 +998,16 @@ namespace transport
 			if (session && session->IsEstablished ())
 			{
 				if (ts < session->GetCreationTime () + SSU2_TO_INTRODUCER_SESSION_EXPIRATION)
+				{	
 					session->SendKeepAlive ();
-				if (ts < session->GetCreationTime () + SSU2_TO_INTRODUCER_SESSION_DURATION)
-					newList.push_back (it);
+					if (ts < session->GetCreationTime () + SSU2_TO_INTRODUCER_SESSION_DURATION)	
+						newList.push_back (it);
+					else	
+					{	
+						impliedList.push_back (it); // keep in introducers list, but not publish
+						session = nullptr;	
+					}		
+				}	
 				else
 					session = nullptr;
 			}
@@ -1014,6 +1021,7 @@ namespace transport
 			{
 				// bump creation time for previous introducers if no new sessions found
 				LogPrint (eLogDebug, "SSU2: No new introducers found. Trying to reuse existing");
+				impliedList.clear ();
 				for (auto& it : introducers)
 				{
 					auto it1 = m_SessionsByRouterHash.find (it);
@@ -1024,10 +1032,7 @@ namespace transport
 						{
 							session->SetCreationTime (session->GetCreationTime () + SSU2_TO_INTRODUCER_SESSION_DURATION);
 							if (std::find (newList.begin (), newList.end (), it) == newList.end ())
-							{
-								newList.push_back (it);
 								sessions.push_back (session);
-							}
 						}
 					}
 				}
@@ -1035,10 +1040,13 @@ namespace transport
 
 			for (const auto& it : sessions)
 			{
+				uint32_t exp = it->GetCreationTime () + SSU2_TO_INTRODUCER_SESSION_EXPIRATION;
+				if (ts + SSU2_TO_INTRODUCER_SESSION_DURATION/2 > exp)
+					continue; // don't pick too old session for introducer	
 				i2p::data::RouterInfo::Introducer introducer;
 				introducer.iTag = it->GetRelayTag ();
 				introducer.iH = it->GetRemoteIdentity ()->GetIdentHash ();
-				introducer.iExp = it->GetCreationTime () + SSU2_TO_INTRODUCER_SESSION_EXPIRATION;
+				introducer.iExp = exp;
 				excluded.insert (it->GetRemoteIdentity ()->GetIdentHash ());
 				if (i2p::context.AddSSU2Introducer (introducer, v4))
 				{
@@ -1072,13 +1080,15 @@ namespace transport
 				}
 			}
 		}
+		introducers.splice (introducers.end (), impliedList);  // insert non-published, but non-expired introducers back
 	}
 
 	void SSU2Server::ScheduleIntroducersUpdateTimer ()
 	{
 		if (m_IsPublished)
 		{
-			m_IntroducersUpdateTimer.expires_from_now (boost::posix_time::seconds(SSU2_KEEP_ALIVE_INTERVAL));
+			m_IntroducersUpdateTimer.expires_from_now (boost::posix_time::seconds(
+				SSU2_KEEP_ALIVE_INTERVAL + rand () % SSU2_KEEP_ALIVE_INTERVAL_VARIANCE));
 			m_IntroducersUpdateTimer.async_wait (std::bind (&SSU2Server::HandleIntroducersUpdateTimer,
 				this, std::placeholders::_1, true));
 		}
@@ -1091,7 +1101,8 @@ namespace transport
 			m_IntroducersUpdateTimer.cancel ();
 			i2p::context.ClearSSU2Introducers (true);
 			m_Introducers.clear ();
-			m_IntroducersUpdateTimer.expires_from_now (boost::posix_time::seconds(SSU2_KEEP_ALIVE_INTERVAL/2));
+			m_IntroducersUpdateTimer.expires_from_now (boost::posix_time::seconds(
+				(SSU2_KEEP_ALIVE_INTERVAL + rand () % SSU2_KEEP_ALIVE_INTERVAL_VARIANCE)/2));
 			m_IntroducersUpdateTimer.async_wait (std::bind (&SSU2Server::HandleIntroducersUpdateTimer,
 				this, std::placeholders::_1, true));
 		}
@@ -1101,7 +1112,8 @@ namespace transport
 	{
 		if (m_IsPublished)
 		{
-			m_IntroducersUpdateTimerV6.expires_from_now (boost::posix_time::seconds(SSU2_KEEP_ALIVE_INTERVAL));
+			m_IntroducersUpdateTimerV6.expires_from_now (boost::posix_time::seconds(
+				SSU2_KEEP_ALIVE_INTERVAL + rand () % SSU2_KEEP_ALIVE_INTERVAL_VARIANCE));
 			m_IntroducersUpdateTimerV6.async_wait (std::bind (&SSU2Server::HandleIntroducersUpdateTimer,
 				this, std::placeholders::_1, false));
 		}
@@ -1114,7 +1126,8 @@ namespace transport
 			m_IntroducersUpdateTimerV6.cancel ();
 			i2p::context.ClearSSU2Introducers (false);
 			m_IntroducersV6.clear ();
-			m_IntroducersUpdateTimerV6.expires_from_now (boost::posix_time::seconds(SSU2_KEEP_ALIVE_INTERVAL/2));
+			m_IntroducersUpdateTimerV6.expires_from_now (boost::posix_time::seconds(
+				(SSU2_KEEP_ALIVE_INTERVAL + rand () % SSU2_KEEP_ALIVE_INTERVAL_VARIANCE)/2));
 			m_IntroducersUpdateTimerV6.async_wait (std::bind (&SSU2Server::HandleIntroducersUpdateTimer,
 				this, std::placeholders::_1, false));
 		}

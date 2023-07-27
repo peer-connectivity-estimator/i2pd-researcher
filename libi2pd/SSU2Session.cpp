@@ -243,7 +243,7 @@ namespace transport
 		if (IsEstablished ())
 		{
 			uint8_t payload[20];
-			size_t payloadSize = CreatePaddingBlock (payload, 20, 5);
+			size_t payloadSize = CreatePaddingBlock (payload, 20, 8);
 			SendData (payload, payloadSize);
 		}
 	}
@@ -1053,6 +1053,17 @@ namespace transport
 			LogPrint (eLogError, "SSU2: SessionConfirmed malformed RouterInfo block");
 			return false;
 		}
+		auto ts = i2p::util::GetMillisecondsSinceEpoch();
+		if (ts > ri->GetTimestamp () + i2p::data::NETDB_MIN_EXPIRATION_TIMEOUT*1000LL) // 90 minutes
+		{
+			LogPrint (eLogError, "SSU2: RouterInfo in SessionConfirmed is too old for ", (ts - ri->GetTimestamp ())/1000LL, " seconds");
+			return false;
+		}	
+		if (ts + i2p::data::NETDB_EXPIRATION_TIMEOUT_THRESHOLD*1000LL < ri->GetTimestamp ()) // 2 minutes
+		{
+			LogPrint (eLogError, "SSU2: RouterInfo in SessionConfirmed is from future for ", (ri->GetTimestamp () - ts)/1000LL, " seconds");
+			return false;
+		}	
 		m_Address = m_RemoteEndpoint.address ().is_v6 () ? ri->GetSSU2V6Address () : ri->GetSSU2V4Address ();
 		if (!m_Address || memcmp (S, m_Address->s, 32))
 		{
@@ -1486,7 +1497,7 @@ namespace transport
 			auto size = bufbe16toh (buf + offset);
 			offset += 2;
 			LogPrint (eLogDebug, "SSU2: Block type ", (int)blk, " of size ", size);
-			if (size > len)
+			if (offset + size > len)
 			{
 				LogPrint (eLogError, "SSU2: Unexpected block length ", size);
 				break;
@@ -1532,16 +1543,21 @@ namespace transport
 				break;
 				case eSSU2BlkTermination:
 				{
-					uint8_t rsn = buf[11]; // reason
-					LogPrint (eLogDebug, "SSU2: Termination reason=", (int)rsn);
-					if (IsEstablished () && rsn != eSSU2TerminationReasonTerminationReceived)
-						RequestTermination (eSSU2TerminationReasonTerminationReceived);
-					else if (m_State != eSSU2SessionStateTerminated)
+					if (size >= 9)
 					{
-						if (m_State == eSSU2SessionStateClosing && rsn == eSSU2TerminationReasonTerminationReceived)
-							m_State = eSSU2SessionStateClosingConfirmed;
-						Done ();
+						uint8_t rsn = buf[offset + 8]; // reason
+						LogPrint (eLogDebug, "SSU2: Termination reason=", (int)rsn);
+						if (IsEstablished () && rsn != eSSU2TerminationReasonTerminationReceived)
+							RequestTermination (eSSU2TerminationReasonTerminationReceived);
+						else if (m_State != eSSU2SessionStateTerminated)
+						{
+							if (m_State == eSSU2SessionStateClosing && rsn == eSSU2TerminationReasonTerminationReceived)
+								m_State = eSSU2SessionStateClosingConfirmed;
+							Done ();
+						}
 					}
+					else
+						LogPrint(eLogWarning, "SSU2: Unexpected termination block size ", size);
 					break;
 				}
 				case eSSU2BlkRelayRequest:
@@ -2841,7 +2857,7 @@ namespace transport
 
 	void SSU2Session::SendPathResponse (const uint8_t * data, size_t len)
 	{
-		if (len < 8 || len > m_MaxPayloadSize - 3)
+		if (len > m_MaxPayloadSize - 3)
 		{
 			LogPrint (eLogWarning, "SSU2: Incorrect data size for path response ", len);
 			return;
@@ -2850,7 +2866,10 @@ namespace transport
 		payload[0] = eSSU2BlkPathResponse;
 		htobe16buf (payload + 1, len);
 		memcpy (payload + 3, data, len);
-		SendData (payload, len + 3);
+		size_t payloadSize = len + 3;	
+		if (payloadSize < m_MaxPayloadSize)
+			payloadSize += CreatePaddingBlock (payload + payloadSize, m_MaxPayloadSize - payloadSize, payloadSize < 8 ? 8 : 0);
+		SendData (payload, payloadSize);
 	}
 
 	void SSU2Session::SendPathChallenge ()
@@ -2868,7 +2887,7 @@ namespace transport
 		}
 		len += 3;
 		if (len < m_MaxPayloadSize)
-			len += CreatePaddingBlock (payload + len, m_MaxPayloadSize - len);
+			len += CreatePaddingBlock (payload + len, m_MaxPayloadSize - len, len < 8 ? 8 : 0);
 		SendData (payload, len);
 	}
 
