@@ -7,4 +7,4 @@ if [ -z "$LOG_FILE_PATH" ]; then
 fi
 
 # Run the i2pd command with the provided or default log file path
-./i2pd --log file --logfile $LOG_FILE_PATH --loglevel debug
+./i2pd --log file --logfile $LOG_FILE_PATH --loglevel info
