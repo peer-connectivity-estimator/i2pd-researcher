@@ -579,7 +579,7 @@ namespace data
 		int numValid = 0;
 		for (auto& it: address->ssu->introducers)
 		{
-			if (it.iTag && ts < it.iExp)
+			if (it.iTag && ts < it.iExp && !it.iH.IsZero ())
 				numValid++;
 			else
 				it.iTag = 0;
@@ -1321,6 +1321,7 @@ namespace data
 					int i = 0;
 					for (const auto& introducer: address.ssu->introducers)
 					{
+						if (!introducer.iTag) continue;
 						if (introducer.iExp) // expiration is specified
 						{
 							WriteString ("iexp" + boost::lexical_cast<std::string>(i), properties);
@@ -1333,6 +1334,7 @@ namespace data
 					i = 0;
 					for (const auto& introducer: address.ssu->introducers)
 					{
+						if (!introducer.iTag) continue;
 						WriteString ("ih" + boost::lexical_cast<std::string>(i), properties);
 						properties << '=';
 						char value[64];
@@ -1345,6 +1347,7 @@ namespace data
 					i = 0;
 					for (const auto& introducer: address.ssu->introducers)
 					{
+						if (!introducer.iTag) continue;
 						WriteString ("itag" + boost::lexical_cast<std::string>(i), properties);
 						properties << '=';
 						WriteString (boost::lexical_cast<std::string>(introducer.iTag), properties);
