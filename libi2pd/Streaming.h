@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2013-2023, The PurpleI2P Project
+* Copyright (c) 2013-2024, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
@@ -56,6 +56,8 @@ namespace stream
 	const int WINDOW_SIZE = 6; // in messages
 	const int MIN_WINDOW_SIZE = 1;
 	const int MAX_WINDOW_SIZE = 128;
+	const int WINDOW_SIZE_DROP_FRACTION = 10; // 1/10
+	const double RTT_EWMA_ALPHA = 0.5;
 	const int INITIAL_RTT = 8000; // in milliseconds
 	const int INITIAL_RTO = 9000; // in milliseconds
 	const int MIN_SEND_ACK_TIMEOUT = 2; // in milliseconds
@@ -135,7 +137,6 @@ namespace stream
 			SendBufferQueue (): m_Size (0) {};
 			~SendBufferQueue () { CleanUp (); };
 
-			void Add (const uint8_t * buf, size_t len, SendHandler handler);
 			void Add (std::shared_ptr<SendBuffer> buf);
 			size_t Get (uint8_t * buf, size_t len);
 			size_t GetSize () const { return m_Size; };
@@ -228,6 +229,7 @@ namespace stream
 
 			void ScheduleResend ();
 			void HandleResendTimer (const boost::system::error_code& ecode);
+			void ScheduleAck (int timeout);
 			void HandleAckSendTimer (const boost::system::error_code& ecode);
 
 		private:
@@ -251,7 +253,6 @@ namespace stream
 			size_t m_NumSentBytes, m_NumReceivedBytes;
 			uint16_t m_Port;
 
-			std::mutex m_SendBufferMutex;
 			SendBufferQueue m_SendBuffer;
 			int m_WindowSize, m_RTT, m_RTO, m_AckDelay;
 			uint64_t m_LastWindowSizeIncreaseTime;

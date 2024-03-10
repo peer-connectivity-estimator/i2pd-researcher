@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2013-2023, The PurpleI2P Project
+* Copyright (c) 2013-2024, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
@@ -367,8 +367,11 @@ namespace client
 				HandleDataMessage (payload, len);
 			break;
 			case eI2NPDeliveryStatus:
-				// we assume tunnel tests non-encrypted
 				HandleDeliveryStatusMessage (bufbe32toh (payload + DELIVERY_STATUS_MSGID_OFFSET));
+			break;
+			case eI2NPTunnelTest:
+				if (m_Pool)
+					m_Pool->ProcessTunnelTest (bufbe32toh (payload + TUNNEL_TEST_MSGID_OFFSET), bufbe64toh (payload + TUNNEL_TEST_TIMESTAMP_OFFSET));
 			break;
 			case eI2NPDatabaseStore:
 				HandleDatabaseStoreMessage (payload, len);
@@ -407,6 +410,7 @@ namespace client
 		}
 		i2p::data::IdentHash key (buf + DATABASE_STORE_KEY_OFFSET);
 		std::shared_ptr<i2p::data::LeaseSet> leaseSet;
+		std::shared_ptr<LeaseSetRequest> request;
 		switch (buf[DATABASE_STORE_TYPE_OFFSET])
 		{
 			case i2p::data::NETDB_STORE_TYPE_LEASESET: // 1
@@ -462,34 +466,59 @@ namespace client
 			case i2p::data::NETDB_STORE_TYPE_ENCRYPTED_LEASESET2: // 5
 			{
 				auto it2 = m_LeaseSetRequests.find (key);
-				if (it2 != m_LeaseSetRequests.end () && it2->second->requestedBlindedKey)
-				{
-					auto ls2 = std::make_shared<i2p::data::LeaseSet2> (buf + offset, len - offset,
-						it2->second->requestedBlindedKey, m_LeaseSetPrivKey ? ((const uint8_t *)*m_LeaseSetPrivKey) : nullptr , GetPreferredCryptoType ());
-					if (ls2->IsValid () && !ls2->IsExpired ())
+				if (it2 != m_LeaseSetRequests.end ())
+				{	
+					request = it2->second;
+					m_LeaseSetRequests.erase (it2);
+					if (request->requestedBlindedKey)
 					{
-						leaseSet = ls2;
-						std::lock_guard<std::mutex> lock(m_RemoteLeaseSetsMutex);
-						m_RemoteLeaseSets[ls2->GetIdentHash ()] = ls2; // ident is not key
-						m_RemoteLeaseSets[key] = ls2; // also store as key for next lookup
+						auto ls2 = std::make_shared<i2p::data::LeaseSet2> (buf + offset, len - offset,
+							request->requestedBlindedKey, m_LeaseSetPrivKey ? ((const uint8_t *)*m_LeaseSetPrivKey) : nullptr , GetPreferredCryptoType ());
+						if (ls2->IsValid () && !ls2->IsExpired ())
+						{
+							leaseSet = ls2;
+							std::lock_guard<std::mutex> lock(m_RemoteLeaseSetsMutex);
+							m_RemoteLeaseSets[ls2->GetIdentHash ()] = ls2; // ident is not key
+							m_RemoteLeaseSets[key] = ls2; // also store as key for next lookup
+						}
+						else
+							LogPrint (eLogError, "Destination: New remote encrypted LeaseSet2 failed");
 					}
 					else
-						LogPrint (eLogError, "Destination: New remote encrypted LeaseSet2 failed");
+					{
+						// publishing verification doesn't have requestedBlindedKey
+						auto localLeaseSet = GetLeaseSetMt ();
+						if (localLeaseSet->GetStoreHash () == key)
+						{	
+							auto ls = std::make_shared<i2p::data::LeaseSet2> (i2p::data::NETDB_STORE_TYPE_ENCRYPTED_LEASESET2, 
+								localLeaseSet->GetBuffer (), localLeaseSet->GetBufferLen (), false);
+							leaseSet = ls;	
+						}	
+						else
+							LogPrint (eLogWarning, "Destination: Encrypted LeaseSet2 received for request without blinded key");
+					}	
 				}
 				else
-					LogPrint (eLogInfo, "Destination: Couldn't find request for encrypted LeaseSet2");
+					LogPrint (eLogWarning, "Destination: Couldn't find request for encrypted LeaseSet2");
 				break;
 			}
 			default:
 				LogPrint (eLogError, "Destination: Unexpected client's DatabaseStore type ", buf[DATABASE_STORE_TYPE_OFFSET], ", dropped");
 		}
 
-		auto it1 = m_LeaseSetRequests.find (key);
-		if (it1 != m_LeaseSetRequests.end ())
+		if (!request)
+		{	
+			auto it1 = m_LeaseSetRequests.find (key);
+			if (it1 != m_LeaseSetRequests.end ())
+			{	
+				request = it1->second;
+				m_LeaseSetRequests.erase (it1);
+			}	
+		}	
+		if (request)
 		{
-			it1->second->requestTimeoutTimer.cancel ();
-			if (it1->second) it1->second->Complete (leaseSet);
-			m_LeaseSetRequests.erase (it1);
+			request->requestTimeoutTimer.cancel ();
+			request->Complete (leaseSet);
 		}
 	}
 
@@ -502,38 +531,43 @@ namespace client
 		if (it != m_LeaseSetRequests.end ())
 		{
 			auto request = it->second;
-			bool found = false;
-			if (request->excluded.size () < MAX_NUM_FLOODFILLS_PER_REQUEST)
+			for (int i = 0; i < num; i++)
 			{
-				for (int i = 0; i < num; i++)
+				i2p::data::IdentHash peerHash (buf + 33 + i*32);
+				if (!request->excluded.count (peerHash) && !i2p::data::netdb.FindRouter (peerHash))
 				{
-					i2p::data::IdentHash peerHash (buf + 33 + i*32);
-					if (!request->excluded.count (peerHash) && !i2p::data::netdb.FindRouter (peerHash))
-					{
-						LogPrint (eLogInfo, "Destination: Found new floodfill, request it");
-						i2p::data::netdb.RequestDestination (peerHash, nullptr, false); // through exploratory
-					}
-				}
-
-				auto floodfill = i2p::data::netdb.GetClosestFloodfill (key, request->excluded);
-				if (floodfill)
-				{
-					LogPrint (eLogInfo, "Destination: Requesting ", key.ToBase64 (), " at ", floodfill->GetIdentHash ().ToBase64 ());
-					if (SendLeaseSetRequest (key, floodfill, request))
-						found = true;
+					LogPrint (eLogInfo, "Destination: Found new floodfill, request it");
+					i2p::data::netdb.RequestDestination (peerHash, nullptr, false); // through exploratory
 				}
 			}
-			if (!found)
-			{
-				LogPrint (eLogInfo, "Destination: ", key.ToBase64 (), " was not found on ", MAX_NUM_FLOODFILLS_PER_REQUEST, " floodfills");
-				request->Complete (nullptr);
-				m_LeaseSetRequests.erase (key);
-			}
+			SendNextLeaseSetRequest (key, request);
 		}
 		else
 			LogPrint (eLogWarning, "Destination: Request for ", key.ToBase64 (), " not found");
 	}
 
+	void LeaseSetDestination::SendNextLeaseSetRequest (const i2p::data::IdentHash& key, 
+		std::shared_ptr<LeaseSetRequest> request)
+	{
+		bool found = false;
+		if (request->excluded.size () < MAX_NUM_FLOODFILLS_PER_REQUEST)
+		{
+			auto floodfill = i2p::data::netdb.GetClosestFloodfill (key, request->excluded);
+			if (floodfill)
+			{
+				LogPrint (eLogInfo, "Destination: Requesting ", key.ToBase64 (), " at ", floodfill->GetIdentHash ().ToBase64 ());
+				if (SendLeaseSetRequest (key, floodfill, request))
+					found = true;
+			}
+		}
+		if (!found)
+		{
+			LogPrint (eLogInfo, "Destination: ", key.ToBase64 (), " was not found on ", MAX_NUM_FLOODFILLS_PER_REQUEST, " floodfills");
+			request->Complete (nullptr);
+			m_LeaseSetRequests.erase (key);
+		}
+	}	
+		
 	void LeaseSetDestination::HandleDeliveryStatusMessage (uint32_t msgID)
 	{
 		if (msgID == m_PublishReplyToken)
@@ -578,12 +612,7 @@ namespace client
 				shared_from_this (), std::placeholders::_1));
 			return;
 		}
-		if (!m_Pool->GetInboundTunnels ().size () || !m_Pool->GetOutboundTunnels ().size ())
-		{
-			LogPrint (eLogError, "Destination: Can't publish LeaseSet. Destination is not ready");
-			return;
-		}
-		auto floodfill = i2p::data::netdb.GetClosestFloodfill (leaseSet->GetIdentHash (), m_ExcludedFloodfills);
+		auto floodfill = i2p::data::netdb.GetClosestFloodfill (leaseSet->GetStoreHash (), m_ExcludedFloodfills);
 		if (!floodfill)
 		{
 			LogPrint (eLogError, "Destination: Can't publish LeaseSet, no more floodfills found");
@@ -594,26 +623,39 @@ namespace client
 		auto inbound = m_Pool->GetNextInboundTunnel (nullptr, floodfill->GetCompatibleTransports (true));
 		if (!outbound || !inbound)
 		{
-			LogPrint (eLogInfo, "Destination: No compatible tunnels with ", floodfill->GetIdentHash ().ToBase64 (), ". Trying another floodfill");
-			m_ExcludedFloodfills.insert (floodfill->GetIdentHash ());
-			floodfill = i2p::data::netdb.GetClosestFloodfill (leaseSet->GetIdentHash (), m_ExcludedFloodfills);
-			if (floodfill)
-			{
-				outbound = m_Pool->GetNextOutboundTunnel (nullptr, floodfill->GetCompatibleTransports (false));
-				if (outbound)
+			if (!m_Pool->GetInboundTunnels ().empty () && !m_Pool->GetOutboundTunnels ().empty ())
+			{	
+				LogPrint (eLogInfo, "Destination: No compatible tunnels with ", floodfill->GetIdentHash ().ToBase64 (), ". Trying another floodfill");
+				m_ExcludedFloodfills.insert (floodfill->GetIdentHash ());
+				floodfill = i2p::data::netdb.GetClosestFloodfill (leaseSet->GetStoreHash (), m_ExcludedFloodfills);
+				if (floodfill)
 				{
-					inbound = m_Pool->GetNextInboundTunnel (nullptr, floodfill->GetCompatibleTransports (true));
-					if (!inbound)
-						LogPrint (eLogError, "Destination: Can't publish LeaseSet. No inbound tunnels");
+					outbound = m_Pool->GetNextOutboundTunnel (nullptr, floodfill->GetCompatibleTransports (false));
+					if (outbound)
+					{
+						inbound = m_Pool->GetNextInboundTunnel (nullptr, floodfill->GetCompatibleTransports (true));
+						if (!inbound)
+							LogPrint (eLogError, "Destination: Can't publish LeaseSet. No inbound tunnels");
+					}
+					else
+						LogPrint (eLogError, "Destination: Can't publish LeaseSet. No outbound tunnels");
 				}
 				else
-					LogPrint (eLogError, "Destination: Can't publish LeaseSet. No outbound tunnels");
-			}
+					LogPrint (eLogError, "Destination: Can't publish LeaseSet, no more floodfills found");
+			}	
 			else
-				LogPrint (eLogError, "Destination: Can't publish LeaseSet, no more floodfills found");
+				LogPrint (eLogDebug, "Destination: No tunnels in pool");
+			
 			if (!floodfill || !outbound || !inbound)
 			{
+				// we can't publish now
 				m_ExcludedFloodfills.clear ();
+				m_PublishReplyToken = 1; // dummy non-zero value
+				// try again after a while
+				LogPrint (eLogInfo, "Destination: Can't publish LeasetSet because destination is not ready. Try publishing again after ", PUBLISH_CONFIRMATION_TIMEOUT, " seconds");
+				m_PublishConfirmationTimer.expires_from_now (boost::posix_time::seconds(PUBLISH_CONFIRMATION_TIMEOUT));
+				m_PublishConfirmationTimer.async_wait (std::bind (&LeaseSetDestination::HandlePublishConfirmationTimer,
+					shared_from_this (), std::placeholders::_1));
 				return;
 			}
 		}
@@ -621,6 +663,15 @@ namespace client
 		LogPrint (eLogDebug, "Destination: Publish LeaseSet of ", GetIdentHash ().ToBase32 ());
 		RAND_bytes ((uint8_t *)&m_PublishReplyToken, 4);
 		auto msg = WrapMessageForRouter (floodfill, i2p::CreateDatabaseStoreMsg (leaseSet, m_PublishReplyToken, inbound));
+		auto s = shared_from_this ();
+		msg->onDrop = [s]()
+			{
+				s->GetService ().post([s]()
+					{
+						s->m_PublishConfirmationTimer.cancel ();
+						s->HandlePublishConfirmationTimer (boost::system::error_code());
+					});
+			};
 		m_PublishConfirmationTimer.expires_from_now (boost::posix_time::seconds(PUBLISH_CONFIRMATION_TIMEOUT));
 		m_PublishConfirmationTimer.async_wait (std::bind (&LeaseSetDestination::HandlePublishConfirmationTimer,
 			shared_from_this (), std::placeholders::_1));
@@ -637,7 +688,7 @@ namespace client
 				m_PublishReplyToken = 0;
 				if (GetIdentity ()->GetCryptoKeyType () == i2p::data::CRYPTO_KEY_TYPE_ELGAMAL)
 				{
-					LogPrint (eLogWarning, "Destination: Publish confirmation was not received in ", PUBLISH_CONFIRMATION_TIMEOUT, " seconds, will try again");
+					LogPrint (eLogWarning, "Destination: Publish confirmation was not received in ", PUBLISH_CONFIRMATION_TIMEOUT, " seconds or failed. will try again");
 					Publish ();
 				}
 				else
@@ -822,8 +873,17 @@ namespace client
 				AddECIESx25519Key (replyKey, replyTag);
 			else
 				AddSessionKey (replyKey, replyTag);
-			auto msg = WrapMessageForRouter (nextFloodfill, CreateLeaseSetDatabaseLookupMsg (dest,
-				request->excluded, request->replyTunnel, replyKey, replyTag, isECIES));
+			
+			auto msg = WrapMessageForRouter (nextFloodfill, 
+				CreateLeaseSetDatabaseLookupMsg (dest, request->excluded, request->replyTunnel, replyKey, replyTag, isECIES));
+			auto s = shared_from_this ();
+			msg->onDrop = [s, dest, request]()
+				{
+					s->GetService ().post([s, dest, request]()
+						{
+							s->SendNextLeaseSetRequest (dest, request);
+						});
+				};	
 			request->outboundTunnel->SendTunnelDataMsgs (
 				{
 					i2p::tunnel::TunnelMessageBlock

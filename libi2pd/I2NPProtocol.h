@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2013-2023, The PurpleI2P Project
+* Copyright (c) 2013-2024, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
@@ -13,6 +13,7 @@
 #include <string.h>
 #include <set>
 #include <memory>
+#include <functional>
 #include "Crypto.h"
 #include "I2PEndian.h"
 #include "Identity.h"
@@ -46,6 +47,11 @@ namespace i2p
 	const size_t DELIVERY_STATUS_MSGID_OFFSET = 0;
 	const size_t DELIVERY_STATUS_TIMESTAMP_OFFSET = DELIVERY_STATUS_MSGID_OFFSET + 4;
 	const size_t DELIVERY_STATUS_SIZE = DELIVERY_STATUS_TIMESTAMP_OFFSET + 8;
+
+	// TunnelTest
+	const size_t TUNNEL_TEST_MSGID_OFFSET = 0;
+	const size_t TUNNEL_TEST_TIMESTAMP_OFFSET = TUNNEL_TEST_MSGID_OFFSET + 4;
+	const size_t TUNNEL_TEST_SIZE = TUNNEL_TEST_TIMESTAMP_OFFSET + 8;
 
 	// DatabaseStore
 	const size_t DATABASE_STORE_KEY_OFFSET = 0;
@@ -115,7 +121,8 @@ namespace i2p
 		eI2NPVariableTunnelBuild = 23,
 		eI2NPVariableTunnelBuildReply = 24,
 		eI2NPShortTunnelBuild = 25,
-		eI2NPShortTunnelBuildReply = 26
+		eI2NPShortTunnelBuildReply = 26,
+		eI2NPTunnelTest = 231
 	};
 
 	const uint8_t TUNNEL_BUILD_RECORD_GATEWAY_FLAG = 0x80;
@@ -138,6 +145,10 @@ namespace tunnel
 	class TunnelPool;
 }
 
+	const int CONGESTION_LEVEL_MEDIUM = 70;
+	const int CONGESTION_LEVEL_HIGH = 90;
+	const int CONGESTION_LEVEL_FULL = 100;
+
 	const size_t I2NP_MAX_MESSAGE_SIZE = 62708;
 	const size_t I2NP_MAX_SHORT_MESSAGE_SIZE = 4096;
 	const size_t I2NP_MAX_MEDIUM_MESSAGE_SIZE = 16384;
@@ -149,7 +160,8 @@ namespace tunnel
 		uint8_t * buf;
 		size_t len, offset, maxLen;
 		std::shared_ptr<i2p::tunnel::InboundTunnel> from;
-
+		std::function<void ()> onDrop;
+		
 		I2NPMessage (): buf (nullptr),len (I2NP_HEADER_SIZE + 2),
 			offset(2), maxLen (0), from (nullptr) {}; // reserve 2 bytes for NTCP header
 
@@ -241,7 +253,6 @@ namespace tunnel
 			SetSize (len - offset - I2NP_HEADER_SIZE);
 			SetChks (0);
 		}
-
 		void ToNTCP2 ()
 		{
 			uint8_t * ntcp2 = GetNTCP2Header ();
@@ -252,6 +263,9 @@ namespace tunnel
 		void FillI2NPMessageHeader (I2NPMessageType msgType, uint32_t replyMsgID = 0, bool checksum = true);
 		void RenewI2NPMessageHeader ();
 		bool IsExpired () const;
+		bool IsExpired (uint64_t ts) const; // in milliseconds
+
+		void Drop () { if (onDrop) { onDrop (); onDrop = nullptr; }; }
 	};
 
 	template<int sz>
@@ -271,6 +285,7 @@ namespace tunnel
 	std::shared_ptr<I2NPMessage> CreateI2NPMessage (const uint8_t * buf, size_t len, std::shared_ptr<i2p::tunnel::InboundTunnel> from = nullptr);
 	std::shared_ptr<I2NPMessage> CopyI2NPMessage (std::shared_ptr<I2NPMessage> msg);
 
+	std::shared_ptr<I2NPMessage> CreateTunnelTestMsg (uint32_t msgID);
 	std::shared_ptr<I2NPMessage> CreateDeliveryStatusMsg (uint32_t msgID);
 	std::shared_ptr<I2NPMessage> CreateRouterInfoDatabaseLookupMsg (const uint8_t * key, const uint8_t * from,
 		uint32_t replyTunnelID, bool exploratory = false, std::set<i2p::data::IdentHash> * excludedPeers = nullptr);

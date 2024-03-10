@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2013-2022, The PurpleI2P Project
+* Copyright (c) 2013-2023, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
@@ -28,6 +28,11 @@ namespace data
 		return T32;
 	}
 
+	bool IsBase32 (char ch)
+	{
+		return (ch >= 'a' && ch <= 'z') || (ch >= '2' && ch <= '7');
+	}	
+	
 	static void iT64Build(void);
 
 	/*
@@ -55,6 +60,11 @@ namespace data
 		return T64;
 	}
 
+	bool IsBase64 (char ch)
+	{
+		return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '~';
+	}	
+	
 	/*
 	* Reverse Substitution Table (built in run time)
 	*/
@@ -272,7 +282,7 @@ namespace data
 
 	size_t Base32ToByteStream (const char * inBuf, size_t len, uint8_t * outBuf, size_t outLen)
 	{
-		int tmp = 0, bits = 0;
+		unsigned int tmp = 0, bits = 0;
 		size_t ret = 0;
 		for (size_t i = 0; i < len; i++)
 		{

@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2013-2023, The PurpleI2P Project
+* Copyright (c) 2013-2024, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
@@ -140,10 +140,8 @@ namespace transport
 		m_X25519KeysPairSupplier (15), // 15 pre-generated keys
 		m_TotalSentBytes (0), m_TotalReceivedBytes (0), m_TotalTransitTransmittedBytes (0),
 		m_InBandwidth (0), m_OutBandwidth (0), m_TransitBandwidth (0),
-		m_LastInBandwidthUpdateBytes (0), m_LastOutBandwidthUpdateBytes (0), m_LastTransitBandwidthUpdateBytes (0),
 		m_InBandwidth15s (0), m_OutBandwidth15s (0), m_TransitBandwidth15s (0),
-		m_LastInBandwidth15sUpdateBytes (0), m_LastOutBandwidth15sUpdateBytes (0), m_LastTransitBandwidth15sUpdateBytes (0),
-		m_LastBandwidth15sUpdateTime (0)
+		m_InBandwidth5m (0), m_OutBandwidth5m (0), m_TransitBandwidth5m (0)
 	{
 	}
 
@@ -306,6 +304,16 @@ namespace transport
 		m_PeerCleanupTimer->expires_from_now (boost::posix_time::seconds(5 * SESSION_CREATION_TIMEOUT));
 		m_PeerCleanupTimer->async_wait (std::bind (&Transports::HandlePeerCleanupTimer, this, std::placeholders::_1));
 
+		uint64_t ts = i2p::util::GetMillisecondsSinceEpoch();
+		for (int i = 0; i < TRAFFIC_SAMPLE_COUNT; i++)
+		{
+			m_TrafficSamples[i].Timestamp = ts - (TRAFFIC_SAMPLE_COUNT - i - 1) * 1000;
+			m_TrafficSamples[i].TotalReceivedBytes = 0;
+			m_TrafficSamples[i].TotalSentBytes = 0;
+			m_TrafficSamples[i].TotalTransitTransmittedBytes = 0;
+		}
+		m_TrafficSamplePtr = TRAFFIC_SAMPLE_COUNT - 1;
+
 		m_UpdateBandwidthTimer->expires_from_now (boost::posix_time::seconds(1));
 		m_UpdateBandwidthTimer->async_wait (std::bind (&Transports::HandleUpdateBandwidthTimer, this, std::placeholders::_1));
 
@@ -364,51 +372,67 @@ namespace transport
 		}
 	}
 
+	void Transports::UpdateBandwidthValues(int interval, uint32_t& in, uint32_t& out, uint32_t& transit)
+	{
+		TrafficSample& sample1 = m_TrafficSamples[m_TrafficSamplePtr];
+		TrafficSample& sample2 = m_TrafficSamples[(TRAFFIC_SAMPLE_COUNT + m_TrafficSamplePtr - interval) % TRAFFIC_SAMPLE_COUNT];
+		auto delta = (int64_t)sample1.Timestamp - (int64_t)sample2.Timestamp;
+		if (delta <= 0)
+		{
+			LogPrint (eLogError, "Transports: Backward clock jump detected, got ", delta, " instead of ", interval * 1000);
+			return;
+		}
+		in = (sample1.TotalReceivedBytes - sample2.TotalReceivedBytes) * 1000 / delta;
+		out = (sample1.TotalSentBytes - sample2.TotalSentBytes) * 1000 / delta;
+		transit = (sample1.TotalTransitTransmittedBytes - sample2.TotalTransitTransmittedBytes) * 1000 / delta;
+	}
+
 	void Transports::HandleUpdateBandwidthTimer (const boost::system::error_code& ecode)
 	{
 		if (ecode != boost::asio::error::operation_aborted)
 		{
-			uint64_t ts = i2p::util::GetMillisecondsSinceEpoch ();
+			m_TrafficSamplePtr++;
+			if (m_TrafficSamplePtr == TRAFFIC_SAMPLE_COUNT)
+				m_TrafficSamplePtr = 0;
 
-			// updated every second
-			m_InBandwidth = m_TotalReceivedBytes - m_LastInBandwidthUpdateBytes;
-			m_OutBandwidth = m_TotalSentBytes - m_LastOutBandwidthUpdateBytes;
-			m_TransitBandwidth = m_TotalTransitTransmittedBytes - m_LastTransitBandwidthUpdateBytes;
+			TrafficSample& sample = m_TrafficSamples[m_TrafficSamplePtr];
+			sample.Timestamp = i2p::util::GetMillisecondsSinceEpoch();
+			sample.TotalReceivedBytes = m_TotalReceivedBytes;
+			sample.TotalSentBytes = m_TotalSentBytes;
+			sample.TotalTransitTransmittedBytes = m_TotalTransitTransmittedBytes;
 
-			m_LastInBandwidthUpdateBytes = m_TotalReceivedBytes;
-			m_LastOutBandwidthUpdateBytes = m_TotalSentBytes;
-			m_LastTransitBandwidthUpdateBytes = m_TotalTransitTransmittedBytes;
-
-			// updated every 15 seconds
-			auto delta = ts - m_LastBandwidth15sUpdateTime;
-			if (delta > 15 * 1000)
-			{
-				m_InBandwidth15s = (m_TotalReceivedBytes - m_LastInBandwidth15sUpdateBytes) * 1000 / delta;
-				m_OutBandwidth15s = (m_TotalSentBytes - m_LastOutBandwidth15sUpdateBytes) * 1000 / delta;
-				m_TransitBandwidth15s = (m_TotalTransitTransmittedBytes - m_LastTransitBandwidth15sUpdateBytes) * 1000 / delta;
-
-				m_LastBandwidth15sUpdateTime = ts;
-				m_LastInBandwidth15sUpdateBytes = m_TotalReceivedBytes;
-				m_LastOutBandwidth15sUpdateBytes = m_TotalSentBytes;
-				m_LastTransitBandwidth15sUpdateBytes = m_TotalTransitTransmittedBytes;
-			}
+			UpdateBandwidthValues (1, m_InBandwidth, m_OutBandwidth, m_TransitBandwidth);
+			UpdateBandwidthValues (15, m_InBandwidth15s, m_OutBandwidth15s, m_TransitBandwidth15s);
+			UpdateBandwidthValues (300, m_InBandwidth5m, m_OutBandwidth5m, m_TransitBandwidth5m);
 
 			m_UpdateBandwidthTimer->expires_from_now (boost::posix_time::seconds(1));
 			m_UpdateBandwidthTimer->async_wait (std::bind (&Transports::HandleUpdateBandwidthTimer, this, std::placeholders::_1));
 		}
 	}
 
-	bool Transports::IsBandwidthExceeded () const
+	int Transports::GetCongestionLevel (bool longTerm) const
 	{
-		auto limit = i2p::context.GetBandwidthLimit() * 1024; // convert to bytes
-		auto bw = std::max (m_InBandwidth15s, m_OutBandwidth15s);
-		return bw > limit;
-	}
+		auto bwLimit = i2p::context.GetBandwidthLimit () * 1024; // convert to bytes
+		auto tbwLimit = i2p::context.GetTransitBandwidthLimit () * 1024; // convert to bytes
 
-	bool Transports::IsTransitBandwidthExceeded () const
-	{
-		auto limit = i2p::context.GetTransitBandwidthLimit() * 1024; // convert to bytes
-		return m_TransitBandwidth > limit;
+		if (tbwLimit == 0 || bwLimit == 0)
+			return CONGESTION_LEVEL_FULL;
+
+		uint32_t bw;
+		uint32_t tbw;
+		if (longTerm)
+		{
+			bw = std::max (m_InBandwidth5m, m_OutBandwidth5m);
+			tbw = m_TransitBandwidth5m;
+		}
+		else
+		{
+			bw = std::max (m_InBandwidth15s, m_OutBandwidth15s);
+			tbw = m_TransitBandwidth;
+		}
+		auto bwCongestionLevel = CONGESTION_LEVEL_FULL * bw / bwLimit;
+		auto tbwCongestionLevel = CONGESTION_LEVEL_FULL * tbw / tbwLimit;
+		return std::max (bwCongestionLevel, tbwCongestionLevel);
 	}
 
 	void Transports::SendMessage (const i2p::data::IdentHash& ident, std::shared_ptr<i2p::I2NPMessage> msg)
@@ -436,6 +460,9 @@ namespace transport
 		auto it = m_Peers.find (ident);
 		if (it == m_Peers.end ())
 		{
+			// check if not banned
+			if (i2p::data::IsRouterBanned (ident)) return; // don't create peer to unreachable router
+			// try to connect
 			bool connected = false;
 			try
 			{
@@ -454,7 +481,7 @@ namespace transport
 			}
 			if (!connected) return;
 		}
-		if (!it->second.sessions.empty ())
+		if (it->second.IsConnected ())
 			it->second.sessions.front ()->SendI2NPMessages (msgs);
 		else
 		{
@@ -463,17 +490,19 @@ namespace transport
 			{
 				if (sz < CHECK_PROFILE_NUM_DELAYED_MESSAGES && sz + msgs.size () >= CHECK_PROFILE_NUM_DELAYED_MESSAGES)
 				{
-					auto profile = i2p::data::GetRouterProfile (ident);
-					if (profile && profile->IsUnreachable ())
+					if (i2p::data::IsRouterBanned (ident))
 					{
-						LogPrint (eLogWarning, "Transports: Peer profile for ", ident.ToBase64 (), " reports unreachable. Dropped");
+						LogPrint (eLogWarning, "Transports: Router ", ident.ToBase64 (), " is banned. Peer dropped");
 						std::unique_lock<std::mutex> l(m_PeersMutex);
 						m_Peers.erase (it);
 						return;
 					}	
 				}	
 				for (auto& it1: msgs)
-					it->second.delayedMessages.push_back (it1);
+					if (sz > MAX_NUM_DELAYED_MESSAGES/2 && it1->onDrop)
+						it1->Drop (); // drop earlier because we can handle it
+					else
+						it->second.delayedMessages.push_back (it1);
 			}
 			else
 			{
@@ -505,7 +534,7 @@ namespace transport
 						if (!m_NTCP2Server) continue;
 						std::shared_ptr<const RouterInfo::Address> address = (tr == i2p::data::RouterInfo::eNTCP2V6) ?
 							peer.router->GetPublishedNTCP2V6Address () : peer.router->GetPublishedNTCP2V4Address ();
-						if (address && m_CheckReserved && i2p::util::net::IsInReservedRange(address->host))
+						if (address && IsInReservedRange(address->host))
 							address = nullptr;
 						if (address)
 						{
@@ -524,7 +553,7 @@ namespace transport
 						if (!m_SSU2Server) continue;
 						std::shared_ptr<const RouterInfo::Address> address = (tr == i2p::data::RouterInfo::eSSU2V6) ?
 							peer.router->GetSSU2V6Address () : peer.router->GetSSU2V4Address ();
-						if (address && m_CheckReserved && i2p::util::net::IsInReservedRange(address->host))
+						if (address && IsInReservedRange(address->host))
 							address = nullptr;
 						if (address && address->IsReachableSSU ())
 						{
@@ -553,6 +582,14 @@ namespace transport
 			LogPrint (eLogInfo, "Transports: No compatible addresses available");
 			if (peer.router->IsReachableFrom (i2p::context.GetRouterInfo ()))
 				i2p::data::netdb.SetUnreachable (ident, true); // we are here because all connection attempts failed but router claimed them
+			peer.Done ();
+			std::unique_lock<std::mutex> l(m_PeersMutex);
+			m_Peers.erase (ident);
+			return false;
+		}
+		else if (i2p::data::IsRouterBanned (ident))
+		{
+			LogPrint (eLogWarning, "Transports: Router ", ident.ToBase64 (), " is banned. Peer dropped");
 			peer.Done ();
 			std::unique_lock<std::mutex> l(m_PeersMutex);
 			m_Peers.erase (ident);
@@ -612,7 +649,8 @@ namespace transport
 			{
 				LogPrint (eLogDebug, "Transports: RouterInfo for ", ident.ToBase64 (), " found, trying to connect");
 				it->second.SetRouter (r);
-				ConnectToPeer (ident, it->second);
+				if (!it->second.IsConnected ())
+					ConnectToPeer (ident, it->second);
 			}
 			else
 			{
@@ -645,14 +683,33 @@ namespace transport
 			LogPrint (eLogInfo, "Transports: Started peer test IPv4");
 			std::set<i2p::data::IdentHash> excluded;
 			excluded.insert (i2p::context.GetIdentHash ()); // don't pick own router
+			int testDelay = 0;
 			for (int i = 0; i < 5; i++)
 			{
 				auto router = i2p::data::netdb.GetRandomSSU2PeerTestRouter (true, excluded); // v4
 				if (router)
 				{
 					if (!i2p::context.GetTesting ())
+					{	
 						i2p::context.SetTesting (true);
-					m_SSU2Server->StartPeerTest (router, true);
+						// send first peer test immediately 
+						m_SSU2Server->StartPeerTest (router, true);
+					}	
+					else
+					{
+						testDelay += PEER_TEST_DELAY_INTERVAL + rand() % PEER_TEST_DELAY_INTERVAL_VARIANCE;
+						if (m_Service)
+						{	
+							auto delayTimer = std::make_shared<boost::asio::deadline_timer>(*m_Service);
+							delayTimer->expires_from_now (boost::posix_time::milliseconds (testDelay));
+							delayTimer->async_wait (
+								[this, router, delayTimer](const boost::system::error_code& ecode)
+								{
+									if (ecode != boost::asio::error::operation_aborted)
+										m_SSU2Server->StartPeerTest (router, true);
+								});		
+						}	
+					}	
 					excluded.insert (router->GetIdentHash ());
 				}
 			}
@@ -664,14 +721,33 @@ namespace transport
 			LogPrint (eLogInfo, "Transports: Started peer test IPv6");
 			std::set<i2p::data::IdentHash> excluded;
 			excluded.insert (i2p::context.GetIdentHash ()); // don't pick own router
+			int testDelay = 0;
 			for (int i = 0; i < 5; i++)
 			{
 				auto router = i2p::data::netdb.GetRandomSSU2PeerTestRouter (false, excluded); // v6
 				if (router)
 				{
 					if (!i2p::context.GetTestingV6 ())
-						i2p::context.SetTestingV6 (true);
-					m_SSU2Server->StartPeerTest (router, false);
+					{	
+						i2p::context.SetTestingV6 (true);	
+						// send first peer test immediately 
+						m_SSU2Server->StartPeerTest (router, false);
+					}	
+					else
+					{
+						testDelay += PEER_TEST_DELAY_INTERVAL + rand() % PEER_TEST_DELAY_INTERVAL_VARIANCE;
+						if (m_Service)
+						{	
+							auto delayTimer = std::make_shared<boost::asio::deadline_timer>(*m_Service);
+							delayTimer->expires_from_now (boost::posix_time::milliseconds (testDelay));
+							delayTimer->async_wait (
+								[this, router, delayTimer](const boost::system::error_code& ecode)
+								{
+									if (ecode != boost::asio::error::operation_aborted)
+										m_SSU2Server->StartPeerTest (router, false);
+								});		
+						}	
+					}
 					excluded.insert (router->GetIdentHash ());
 				}
 			}
@@ -768,13 +844,13 @@ namespace transport
 			auto it = m_Peers.find (ident);
 			if (it != m_Peers.end ())
 			{
-				auto before = it->second.sessions.size ();
+				bool wasConnected = it->second.IsConnected ();
 				it->second.sessions.remove (session);
-				if (it->second.sessions.empty ())
+				if (!it->second.IsConnected ())
 				{
 					if (it->second.delayedMessages.size () > 0)
 					{
-						if (before > 0) // we had an active session before
+						if (wasConnected) // we had an active session before
 							it->second.numAttempts = 0; // start over
 						ConnectToPeer (ident, it->second);
 					}
@@ -807,7 +883,7 @@ namespace transport
 					{
 						return !session || !session->IsEstablished ();
 					});
- 				if (it->second.sessions.empty () && ts > it->second.creationTime + SESSION_CREATION_TIMEOUT)
+ 				if (!it->second.IsConnected () && ts > it->second.creationTime + SESSION_CREATION_TIMEOUT)
 				{
 					LogPrint (eLogWarning, "Transports: Session to peer ", it->first.ToBase64 (), " has not been created in ", SESSION_CREATION_TIMEOUT, " seconds");
 				/*	if (!it->second.router) 
@@ -833,8 +909,12 @@ namespace transport
 				}
 			}
 			bool ipv4Testing = i2p::context.GetTesting ();
+			if (!ipv4Testing)
+				ipv4Testing = i2p::context.GetRouterInfo ().IsSSU2V4 () && (i2p::context.GetStatus() == eRouterStatusUnknown);
 			bool ipv6Testing = i2p::context.GetTestingV6 ();
-			// if still testing, repeat peer test
+			if (!ipv6Testing)
+				ipv6Testing = i2p::context.GetRouterInfo ().IsSSU2V6 () && (i2p::context.GetStatusV6() == eRouterStatusUnknown);
+			// if still testing or unknown, repeat peer test
 			if (ipv4Testing || ipv6Testing)
 				PeerTest (ipv4Testing, ipv6Testing);
 			m_PeerCleanupTimer->expires_from_now (boost::posix_time::seconds(3 * SESSION_CREATION_TIMEOUT));
@@ -945,9 +1025,9 @@ namespace transport
 			[isHighBandwidth](const Peer& peer)->bool
 			{
 				// connected, not overloaded and not slow
-				return !peer.router && !peer.sessions.empty () && peer.isReachable &&
+				return !peer.router && peer.IsConnected () && peer.isReachable &&
 					peer.sessions.front ()->GetSendQueueSize () <= PEER_ROUTER_INFO_OVERLOAD_QUEUE_SIZE &&
-					!peer.sessions.front ()->IsSlow () &&
+					!peer.sessions.front ()->IsSlow () && !peer.sessions.front ()->IsBandwidthExceeded (peer.isHighBandwidth) &&
 					(!isHighBandwidth || peer.isHighBandwidth);
 			});
 	}
@@ -965,18 +1045,25 @@ namespace transport
 		}
 	}
 
-	void Transports::RestrictRoutesToRouters(std::set<i2p::data::IdentHash> routers)
+	void Transports::RestrictRoutesToRouters(const std::set<i2p::data::IdentHash>& routers)
 	{
-		std::unique_lock<std::mutex> lock(m_TrustedRoutersMutex);
+		std::lock_guard<std::mutex> lock(m_TrustedRoutersMutex);
 		m_TrustedRouters.clear();
 		for (const auto & ri : routers )
 			m_TrustedRouters.push_back(ri);
 	}
 
-	bool Transports::RoutesRestricted() const {
-		std::unique_lock<std::mutex> famlock(m_FamilyMutex);
-		std::unique_lock<std::mutex> routerslock(m_TrustedRoutersMutex);
-		return m_TrustedFamilies.size() > 0 || m_TrustedRouters.size() > 0;
+	bool Transports::RoutesRestricted() const 
+	{
+		{
+			std::lock_guard<std::mutex> routerslock(m_TrustedRoutersMutex);
+			if (!m_TrustedRouters.empty ()) return true;
+		}
+		{
+			std::lock_guard<std::mutex> famlock(m_FamilyMutex);
+			if (!m_TrustedFamilies.empty ()) return true;
+		}
+		return false;
 	}
 
 	/** XXX: if routes are not restricted this dies */
@@ -1000,7 +1087,7 @@ namespace transport
 				return i2p::data::netdb.GetRandomRouterInFamily(fam);
 		}
 		{
-			std::unique_lock<std::mutex> l(m_TrustedRoutersMutex);
+			std::lock_guard<std::mutex> l(m_TrustedRoutersMutex);
 			auto sz = m_TrustedRouters.size();
 			if (sz)
 			{
@@ -1017,12 +1104,12 @@ namespace transport
 	bool Transports::IsRestrictedPeer(const i2p::data::IdentHash & ih) const
 	{
 		{
-			std::unique_lock<std::mutex> l(m_TrustedRoutersMutex);
+			std::lock_guard<std::mutex> l(m_TrustedRoutersMutex);
 			for (const auto & r : m_TrustedRouters )
 				if ( r == ih ) return true;
 		}
 		{
-			std::unique_lock<std::mutex> l(m_FamilyMutex);
+			std::lock_guard<std::mutex> l(m_FamilyMutex);
 			auto ri = i2p::data::netdb.FindRouter(ih);
 			for (const auto & fam : m_TrustedFamilies)
 				if(ri->IsFamily(fam)) return true;
@@ -1042,6 +1129,11 @@ namespace transport
 		}
 	}
 
+	bool Transports::IsInReservedRange (const boost::asio::ip::address& host) const 
+	{
+		return IsCheckReserved () && i2p::util::net::IsInReservedRange (host);
+	}	
+		
 	void InitAddressFromIface ()
 	{
 		bool ipv6; i2p::config::GetOption("ipv6", ipv6);
@@ -1153,7 +1245,6 @@ namespace transport
 			else
 				i2p::context.PublishSSU2Address (ssu2port, false, ipv4, ipv6); // unpublish
 		}
-
 	}
 }
 }

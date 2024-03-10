@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2013-2023, The PurpleI2P Project
+* Copyright (c) 2013-2024, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
@@ -887,8 +887,7 @@ namespace garlic
 			}
 			else
 			{
-				auto session = it->second.tagset->GetSession ();
-				if (!session || session->IsTerminated())
+				if (it->second.tagset->IsSessionTerminated ())
 				{
 					it = m_ECIESx25519Tags.erase (it);
 					numExpiredTags++;

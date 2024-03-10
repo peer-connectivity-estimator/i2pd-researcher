@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022-2023, The PurpleI2P Project
+* Copyright (c) 2022-2024, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
@@ -24,7 +24,8 @@ namespace transport
 		m_AddressV4 (boost::asio::ip::address_v4()), m_AddressV6 (boost::asio::ip::address_v6()),
 		m_TerminationTimer (GetService ()), m_CleanupTimer (GetService ()), m_ResendTimer (GetService ()),
 		m_IntroducersUpdateTimer (GetService ()), m_IntroducersUpdateTimerV6 (GetService ()),
-		m_IsPublished (true), m_IsSyncClockFromPeers (true), m_IsThroughProxy (false)
+		m_IsPublished (true), m_IsSyncClockFromPeers (true), m_PendingTimeOffset (0),
+		m_IsThroughProxy (false)
 	{
 	}
 
@@ -209,6 +210,42 @@ namespace transport
 		return ep.port ();
 	}
 
+	void SSU2Server::AdjustTimeOffset (int64_t offset, std::shared_ptr<const i2p::data::IdentityEx> from)
+	{
+		if (offset)
+		{	
+			if (m_PendingTimeOffset) // one more
+			{	
+				if (m_PendingTimeOffsetFrom && from && 
+					m_PendingTimeOffsetFrom->GetIdentHash ().GetLL()[0] != from->GetIdentHash ().GetLL()[0]) // from different routers
+				{	
+					if (std::abs (m_PendingTimeOffset - offset) < SSU2_CLOCK_SKEW)
+					{	
+						offset = (m_PendingTimeOffset + offset)/2; // average
+						LogPrint (eLogWarning, "SSU2: Clock adjusted by ", offset, " seconds");
+						i2p::util::AdjustTimeOffset (offset);
+					}	
+					else
+						LogPrint (eLogWarning, "SSU2: Time offsets are too different. Clock not adjusted");
+					m_PendingTimeOffset = 0;
+					m_PendingTimeOffsetFrom = nullptr;
+				}
+				else
+					LogPrint (eLogWarning, "SSU2: Time offsets from same router. Clock not adjusted");
+			}
+			else
+			{	
+				m_PendingTimeOffset = offset; // first 
+				m_PendingTimeOffsetFrom = from;
+			}	
+		}	
+		else
+		{	
+			m_PendingTimeOffset = 0; // reset
+			m_PendingTimeOffsetFrom = nullptr;
+		}	
+	}	
+		
 	boost::asio::ip::udp::socket& SSU2Server::OpenSocket (const boost::asio::ip::udp::endpoint& localEndpoint)
 	{
 		boost::asio::ip::udp::socket& socket = localEndpoint.address ().is_v6 () ? m_SocketV6 : m_SocketV4;
@@ -219,15 +256,49 @@ namespace transport
 			socket.open (localEndpoint.protocol ());
 			if (localEndpoint.address ().is_v6 ())
 				socket.set_option (boost::asio::ip::v6_only (true));
-			socket.set_option (boost::asio::socket_base::receive_buffer_size (SSU2_SOCKET_RECEIVE_BUFFER_SIZE));
-			socket.set_option (boost::asio::socket_base::send_buffer_size (SSU2_SOCKET_SEND_BUFFER_SIZE));
+
+			uint64_t bufferSize = i2p::context.GetBandwidthLimit() * 1024 / 5; // max lag = 200ms
+			bufferSize = std::max(SSU2_SOCKET_MIN_BUFFER_SIZE, std::min(bufferSize, SSU2_SOCKET_MAX_BUFFER_SIZE));
+
+			boost::asio::socket_base::receive_buffer_size receiveBufferSizeSet (bufferSize);
+			boost::asio::socket_base::send_buffer_size sendBufferSizeSet (bufferSize);
+			socket.set_option (receiveBufferSizeSet);
+			socket.set_option (sendBufferSizeSet);
+			boost::asio::socket_base::receive_buffer_size receiveBufferSizeGet;
+			boost::asio::socket_base::send_buffer_size sendBufferSizeGet;
+			socket.get_option (receiveBufferSizeGet);
+			socket.get_option (sendBufferSizeGet);
+			if (receiveBufferSizeGet.value () != receiveBufferSizeSet.value () ||
+				sendBufferSizeGet.value () != sendBufferSizeSet.value ())
+			{
+				LogPrint (eLogWarning, "SSU2: Socket receive buffer size: requested = ",
+					receiveBufferSizeSet.value (), ", got = ", receiveBufferSizeGet.value ());
+				LogPrint (eLogWarning, "SSU2: Socket send buffer size: requested = ",
+					sendBufferSizeSet.value (), ", got = ", sendBufferSizeGet.value ());
+			}
+			else
+			{
+				LogPrint (eLogInfo, "SSU2: Socket receive buffer size: ", receiveBufferSizeGet.value ());
+				LogPrint (eLogInfo, "SSU2: Socket send buffer size: ", sendBufferSizeGet.value ());
+			}
+
+			socket.non_blocking (true);
+		}
+		catch (std::exception& ex )
+		{
+			LogPrint (eLogCritical, "SSU2: Failed to open socket on ", localEndpoint.address (), ": ", ex.what());
+			ThrowFatal ("Unable to start SSU2 transport on ", localEndpoint.address (), ": ", ex.what ());
+			return socket;
+		}
+		try
+		{
 			socket.bind (localEndpoint);
 			LogPrint (eLogInfo, "SSU2: Start listening on ", localEndpoint);
 		}
 		catch (std::exception& ex )
 		{
-			LogPrint (eLogCritical, "SSU2: Failed to bind to ", localEndpoint, ": ", ex.what());
-			ThrowFatal ("Unable to start SSU2 transport on ", localEndpoint, ": ", ex.what ());
+			LogPrint (eLogWarning, "SSU2: Failed to bind to ", localEndpoint, ": ", ex.what(), ". Actual endpoint is ", socket.local_endpoint ());
+			// we can continue without binding being firewalled
 		}
 		return socket;
 	}
@@ -259,8 +330,15 @@ namespace transport
 		// but better to find out which host were sent it and mark that router as unreachable
 		{
 			i2p::transport::transports.UpdateReceivedBytes (bytes_transferred);
+			if (bytes_transferred < SSU2_MIN_RECEIVED_PACKET_SIZE)
+			{
+				// drop too short packets
+				m_PacketsPool.ReleaseMt (packet);
+				Receive (socket);
+				return;
+			}	
 			packet->len = bytes_transferred;
-
+			
 			boost::system::error_code ec;
 			size_t moreBytes = socket.available (ec);
 			if (!ec && moreBytes)
@@ -416,7 +494,7 @@ namespace transport
 		m_PendingOutgoingSessions.erase (ep);
 	}
 
-	std::shared_ptr<SSU2Session> SSU2Server::GetRandomSession (
+	std::shared_ptr<SSU2Session> SSU2Server::GetRandomPeerTestSession (
 		i2p::data::RouterInfo::CompatibleTransports remoteTransports, const i2p::data::IdentHash& excluded) const
 	{
 		if (m_Sessions.empty ()) return nullptr;
@@ -427,7 +505,7 @@ namespace transport
 		std::advance (it, ind);
 		while (it != m_Sessions.end ())
 		{
-			if ((it->second->GetRemoteTransports () & remoteTransports) &&
+			if ((it->second->GetRemotePeerTestTransports () & remoteTransports) &&
 			    it->second->GetRemoteIdentity ()->GetIdentHash () != excluded)
 				return it->second;
 			it++;
@@ -436,7 +514,7 @@ namespace transport
 		it = m_Sessions.begin ();
 		while (it != m_Sessions.end () && ind)
 		{
-			if ((it->second->GetRemoteTransports () & remoteTransports) &&
+			if ((it->second->GetRemotePeerTestTransports () & remoteTransports) &&
 			    it->second->GetRemoteIdentity ()->GetIdentHash () != excluded)
 				return it->second;
 			it++; ind--;
@@ -542,7 +620,7 @@ namespace transport
 				else
 					it1->second->ProcessRetry (buf, len);
 			}
-			else if (!i2p::util::net::IsInReservedRange(senderEndpoint.address ()) && senderEndpoint.port ())
+			else if (!i2p::transport::transports.IsInReservedRange(senderEndpoint.address ()) && senderEndpoint.port ())
 			{
 				// assume new incoming session
 				auto session = std::make_shared<SSU2Session> (*this);
@@ -584,7 +662,10 @@ namespace transport
 		if (!ec)
 			i2p::transport::transports.UpdateSentBytes (headerLen + payloadLen);
 		else
-			LogPrint (eLogError, "SSU2: Send exception: ", ec.message (), " to ", to);
+		{
+			LogPrint (ec == boost::asio::error::would_block ? eLogInfo : eLogError,
+				"SSU2: Send exception: ", ec.message (), " to ", to);
+		}
 	}
 
 	void SSU2Server::Send (const uint8_t * header, size_t headerLen, const uint8_t * headerX, size_t headerXLen,
@@ -618,7 +699,10 @@ namespace transport
 		if (!ec)
 			i2p::transport::transports.UpdateSentBytes (headerLen + headerXLen + payloadLen);
 		else
-			LogPrint (eLogError, "SSU2: Send exception: ", ec.message (), " to ", to);
+		{
+			LogPrint (ec == boost::asio::error::would_block ? eLogInfo : eLogError,
+				"SSU2: Send exception: ", ec.message (), " to ", to);
+		}
 	}
 
 	bool SSU2Server::CreateSession (std::shared_ptr<const i2p::data::RouterInfo> router,
@@ -642,7 +726,7 @@ namespace transport
 			bool isValidEndpoint = !address->host.is_unspecified () && address->port;
 			if (isValidEndpoint)
 			{
-				if (i2p::util::net::IsInReservedRange(address->host)) return false;
+				if (i2p::transport::transports.IsInReservedRange(address->host)) return false;
 				auto s = FindPendingOutgoingSession (boost::asio::ip::udp::endpoint (address->host, address->port));
 				if (s)
 				{
@@ -729,7 +813,7 @@ namespace transport
 				if (addr)
 				{
 					bool isValidEndpoint = !addr->host.is_unspecified () && addr->port &&
-						!i2p::util::net::IsInReservedRange(addr->host);
+						!i2p::transport::transports.IsInReservedRange(addr->host);
 					if (isValidEndpoint)
 					{
 						auto s = FindPendingOutgoingSession (boost::asio::ip::udp::endpoint (addr->host, addr->port));
@@ -772,8 +856,11 @@ namespace transport
 		auto it = m_SessionsByRouterHash.find (router->GetIdentHash ());
 		if (it != m_SessionsByRouterHash.end ())
 		{
-			auto s = it->second;
-			if (it->second->IsEstablished ())
+			auto remoteAddr = it->second->GetAddress ();
+			if (!remoteAddr || !remoteAddr->IsPeerTesting () ||
+			    (v4 && !remoteAddr->IsV4 ()) || (!v4 && !remoteAddr->IsV6 ())) return false;
+			auto s = it->second;    
+			if (s->IsEstablished ())
 				GetService ().post ([s]() { s->SendPeerTest (); });
 			else
 				s->SetOnEstablished ([s]() { s->SendPeerTest (); });

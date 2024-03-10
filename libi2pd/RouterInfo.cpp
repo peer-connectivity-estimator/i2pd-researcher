@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2013-2023, The PurpleI2P Project
+* Copyright (c) 2013-2024, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
@@ -21,6 +21,7 @@
 #include "Base.h"
 #include "Timestamp.h"
 #include "Log.h"
+#include "Transports.h"
 #include "NetDb.hpp"
 #include "RouterContext.h"
 #include "RouterInfo.h"
@@ -130,7 +131,7 @@ namespace data
 			m_BufferLen = s.tellg ();
 			if (m_BufferLen < 40 || m_BufferLen > MAX_RI_BUFFER_SIZE)
 			{
-				LogPrint(eLogError, "RouterInfo: File", fullPath, " is malformed");
+				LogPrint(eLogError, "RouterInfo: File ", fullPath, " is malformed");
 				return false;
 			}
 			s.seekg(0, std::ios::beg);
@@ -253,7 +254,7 @@ namespace data
 					address->host = boost::asio::ip::address::from_string (value, ecode);
 					if (!ecode && !address->host.is_unspecified ())
 					{
-						if (!i2p::util::net::IsInReservedRange (address->host) ||
+						if (!i2p::transport::transports.IsInReservedRange (address->host) ||
 						    i2p::util::net::IsYggdrasilAddress (address->host))
 							isHost = true;
 						else
@@ -515,7 +516,6 @@ namespace data
 				break;
 				case CAPS_FLAG_HIGH_BANDWIDTH1:
 				case CAPS_FLAG_HIGH_BANDWIDTH2:
-				case CAPS_FLAG_HIGH_BANDWIDTH3:
 					m_Caps |= Caps::eHighBandwidth;
 				break;
 				case CAPS_FLAG_EXTRA_BANDWIDTH1:
@@ -995,7 +995,7 @@ namespace data
 
 	bool RouterInfo::IsPublished (bool v4) const
 	{
-		if (m_Caps & (eUnreachable | eHidden)) return false; // if router sets U or H we assume that all addreses are not published
+		if (m_Caps & (eUnreachable | eHidden)) return false; // if router sets U or H we assume that all addresses are not published
 		auto addr = GetAddresses ();
 		if (v4)	
 			return ((*addr)[eNTCP2V4Idx] && ((*addr)[eNTCP2V4Idx])->published) ||
@@ -1177,7 +1177,7 @@ namespace data
 				CAPS_FLAG_EXTRA_BANDWIDTH2 : // 'X'
 				CAPS_FLAG_EXTRA_BANDWIDTH1; // 'P'
 			else
-				caps += CAPS_FLAG_HIGH_BANDWIDTH3; // 'O'
+				caps += CAPS_FLAG_HIGH_BANDWIDTH2; // 'O'
 			caps += CAPS_FLAG_FLOODFILL; // floodfill
 		}
 		else
@@ -1185,7 +1185,7 @@ namespace data
 			if (c & eExtraBandwidth)
 				caps += (c & eHighBandwidth) ? CAPS_FLAG_EXTRA_BANDWIDTH2 /* 'X' */ : CAPS_FLAG_EXTRA_BANDWIDTH1; /*'P' */
 			else
-				caps += (c & eHighBandwidth) ? CAPS_FLAG_HIGH_BANDWIDTH3 /* 'O' */: CAPS_FLAG_LOW_BANDWIDTH2 /* 'L' */; // bandwidth
+				caps += (c & eHighBandwidth) ? CAPS_FLAG_HIGH_BANDWIDTH2 /* 'O' */: CAPS_FLAG_LOW_BANDWIDTH2 /* 'L' */; // bandwidth
 		}
 		if (c & eHidden) caps += CAPS_FLAG_HIDDEN; // hidden
 		if (c & eReachable) caps += CAPS_FLAG_REACHABLE; // reachable

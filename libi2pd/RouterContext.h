@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2013-2023, The PurpleI2P Project
+* Copyright (c) 2013-2024, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
@@ -12,7 +12,6 @@
 #include <inttypes.h>
 #include <string>
 #include <memory>
-#include <chrono>
 #include <set>
 #include <boost/asio.hpp>
 #include "Identity.h"
@@ -38,6 +37,7 @@ namespace garlic
 	const int ROUTER_INFO_CONFIRMATION_TIMEOUT = 5; // in seconds
 	const int ROUTER_INFO_MAX_PUBLISH_EXCLUDED_FLOODFILLS = 15;
 	const int ROUTER_INFO_CONGESTION_UPDATE_INTERVAL = 12*60; // in seconds
+	const int ROUTER_INFO_CLEANUP_INTERVAL = 5; // in minutes
 
 	enum RouterStatus
 	{
@@ -46,6 +46,15 @@ namespace garlic
 		eRouterStatusUnknown = 2,
 		eRouterStatusProxy = 3,
 		eRouterStatusMesh = 4
+	};
+
+	const char* const ROUTER_STATUS_NAMES[] =
+	{
+		"OK", // 0
+		"Firewalled", // 1
+		"Unknown", // 2
+		"Proxy", // 3
+		"Mesh" // 4
 	};
 
 	enum RouterError
@@ -136,6 +145,7 @@ namespace garlic
 			void SetNetID (int netID) { m_NetID = netID; };
 			bool DecryptTunnelBuildRecord (const uint8_t * encrypted, uint8_t * data);
 			bool DecryptTunnelShortRequestRecord (const uint8_t * encrypted, uint8_t * data);
+			void SubmitECIESx25519Key (const uint8_t * key, uint64_t tag);
 
 			void UpdatePort (int port); // called from Daemon
 			void UpdateAddress (const boost::asio::ip::address& host); // called from SSU2 or Daemon
@@ -156,7 +166,7 @@ namespace garlic
 			void SetShareRatio (int percents); // 0 - 100
 			bool AcceptsTunnels () const { return m_AcceptsTunnels; };
 			void SetAcceptsTunnels (bool acceptsTunnels) { m_AcceptsTunnels = acceptsTunnels; };
-			bool IsHighCongestion () const;
+			int GetCongestionLevel (bool longTerm) const;
 			bool SupportsV6 () const { return m_RouterInfo.IsV6 (); };
 			bool SupportsV4 () const { return m_RouterInfo.IsV4 (); };
 			bool SupportsMesh () const { return m_RouterInfo.IsMesh (); };
@@ -171,7 +181,6 @@ namespace garlic
 			void UpdateNTCP2V6Address (const boost::asio::ip::address& host); // called from Daemon. TODO: remove
 			void UpdateStats ();
 			void UpdateTimestamp (uint64_t ts); // in seconds, called from NetDb before publishing
-			void CleanupDestination (); // garlic destination
 
 			// implements LocalDestination
 			std::shared_ptr<const i2p::data::IdentityEx> GetIdentity () const { return m_Keys.GetPublic (); };
@@ -220,6 +229,8 @@ namespace garlic
 			void HandlePublishResendTimer (const boost::system::error_code& ecode);
 			void ScheduleCongestionUpdate ();
 			void HandleCongestionUpdateTimer (const boost::system::error_code& ecode);
+			void ScheduleCleanupTimer ();
+			void HandleCleanupTimer (const boost::system::error_code& ecode);
 			
 		private:
 
@@ -229,7 +240,7 @@ namespace garlic
 			std::shared_ptr<i2p::garlic::RouterIncomingRatchetSession> m_ECIESSession;
 			uint64_t m_LastUpdateTime; // in seconds
 			bool m_AcceptsTunnels, m_IsFloodfill;
-			std::chrono::time_point<std::chrono::steady_clock> m_StartupTime;
+			uint64_t m_StartupTime; // monotonic seconds
 			uint64_t m_BandwidthLimit; // allowed bandwidth
 			int m_ShareRatio;
 			RouterStatus m_Status, m_StatusV6;
@@ -243,7 +254,7 @@ namespace garlic
 			i2p::crypto::NoiseSymmetricState m_InitialNoiseState, m_CurrentNoiseState;
 			// publish
 			std::unique_ptr<RouterService> m_Service;
-			std::unique_ptr<boost::asio::deadline_timer> m_PublishTimer, m_CongestionUpdateTimer;
+			std::unique_ptr<boost::asio::deadline_timer> m_PublishTimer, m_CongestionUpdateTimer, m_CleanupTimer;
 			std::set<i2p::data::IdentHash> m_PublishExcluded;
 			uint32_t m_PublishReplyToken;
 			bool m_IsHiddenMode; // not publish

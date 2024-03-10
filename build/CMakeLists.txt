@@ -25,7 +25,7 @@ project(
   i2pd
   VERSION ${PROJECT_VERSION}
   HOMEPAGE_URL "https://i2pd.website/"
-  LANGUAGES CXX
+  LANGUAGES C CXX
 )
 
 # configurable options
@@ -121,7 +121,7 @@ if(WIN32)
   )
 
   file(GLOB WIN32_RC ${WIN32_SRC_DIR}/*.rc)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DWIN32_APP -DWIN32_LEAN_AND_MEAN")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DWIN32_APP -DWIN32_LEAN_AND_MEAN -DNOMINMAX")
 
 endif()
 
@@ -137,6 +137,10 @@ endif()
 
 if(APPLE)
   add_definitions(-DMAC_OSX)
+endif()
+
+if(HAIKU)
+  add_definitions(-D_DEFAULT_SOURCE -D_GNU_SOURCE)
 endif()
 
 if(MSVC)
@@ -197,14 +201,11 @@ endif()
 
 # Note: AES-NI and AVX is available on x86-based CPU's.
 # Here also ARM64 implementation, but currently we don't support it.
-# MSVC is not supported.
-if(MSVC)
-  message(STATUS "AES-NI is not supported on MSVC, option was disabled")
-  set(WITH_AESNI OFF)
-endif()
-
+# MSVC is not supported due to different ASM processing, so we hope OpenSSL has its own checks to run optimized code.
 if(WITH_AESNI AND (ARCHITECTURE MATCHES "x86_64" OR ARCHITECTURE MATCHES "i386"))
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -maes")
+  if(NOT MSVC)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -maes")
+  endif()
   add_definitions(-D__AES__)
 endif()
 

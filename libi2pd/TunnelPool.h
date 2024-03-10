@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2013-2023, The PurpleI2P Project
+* Copyright (c) 2013-2024, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
@@ -15,6 +15,7 @@
 #include <utility>
 #include <mutex>
 #include <memory>
+#include <random>
 #include "Identity.h"
 #include "LeaseSet.h"
 #include "RouterInfo.h"
@@ -30,7 +31,8 @@ namespace tunnel
 	const int TUNNEL_POOL_MANAGE_INTERVAL = 10; // in seconds
 	const int TUNNEL_POOL_MAX_INBOUND_TUNNELS_QUANTITY = 16;
 	const int TUNNEL_POOL_MAX_OUTBOUND_TUNNELS_QUANTITY = 16;
-	const int TUNNEL_POOL_MAX_NUM_BUILD_REQUESTS = 2;
+	const int TUNNEL_POOL_MAX_NUM_BUILD_REQUESTS = 3;
+	const int TUNNEL_POOL_MAX_HOP_SELECTION_ATTEMPTS = 3;
 
 	class Tunnel;
 	class InboundTunnel;
@@ -83,6 +85,8 @@ namespace tunnel
 			void ManageTunnels (uint64_t ts);
 			void ProcessGarlicMessage (std::shared_ptr<I2NPMessage> msg);
 			void ProcessDeliveryStatus (std::shared_ptr<I2NPMessage> msg);
+			void ProcessTunnelTest (std::shared_ptr<I2NPMessage> msg);
+			bool ProcessTunnelTest (uint32_t msgID, uint64_t timestamp);
 
 			bool IsExploratory () const;
 			bool IsActive () const { return m_IsActive; };
@@ -102,7 +106,7 @@ namespace tunnel
 			bool HasCustomPeerSelector();
 
 			/** @brief make this tunnel pool yield tunnels that fit latency range [min, max] */
-			void RequireLatency(uint64_t min, uint64_t max) { m_MinLatency = min; m_MaxLatency = max; }
+			void RequireLatency(int min, int max) { m_MinLatency = min; m_MaxLatency = max; }
 
 			/** @brief return true if this tunnel pool has a latency requirement */
 			bool HasLatencyRequirement() const { return m_MinLatency > 0 && m_MaxLatency > 0; }
@@ -115,6 +119,8 @@ namespace tunnel
 			std::shared_ptr<const i2p::data::RouterInfo> SelectNextHop (std::shared_ptr<const i2p::data::RouterInfo> prevHop, bool reverse, bool endpoint) const;
 			bool StandardSelectPeers(Path & path, int numHops, bool inbound, SelectHopFunc nextHop);
 
+			std::mt19937& GetRng () { return m_Rng; }
+			
 		private:
 
 			void TestTunnels ();
@@ -145,9 +151,12 @@ namespace tunnel
 			std::mutex m_CustomPeerSelectorMutex;
 			ITunnelPeerSelector * m_CustomPeerSelector;
 
-			uint64_t m_MinLatency = 0; // if > 0 this tunnel pool will try building tunnels with minimum latency by ms
-			uint64_t m_MaxLatency = 0; // if > 0 this tunnel pool will try building tunnels with maximum latency by ms
+			int m_MinLatency = 0; // if > 0 this tunnel pool will try building tunnels with minimum latency by ms
+			int m_MaxLatency = 0; // if > 0 this tunnel pool will try building tunnels with maximum latency by ms
 
+			std::random_device m_Rd;
+			std::mt19937 m_Rng;
+			
 		public:
 
 			// for HTTP only

@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022-2023, The PurpleI2P Project
+* Copyright (c) 2022-2024, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
@@ -81,7 +81,7 @@ namespace transport
 	SSU2Session::SSU2Session (SSU2Server& server, std::shared_ptr<const i2p::data::RouterInfo> in_RemoteRouter,
 		std::shared_ptr<const i2p::data::RouterInfo::Address> addr):
 		TransportSession (in_RemoteRouter, SSU2_CONNECT_TIMEOUT),
-		m_Server (server), m_Address (addr), m_RemoteTransports (0),
+		m_Server (server), m_Address (addr), m_RemoteTransports (0), m_RemotePeerTestTransports (0),
 		m_DestConnID (0), m_SourceConnID (0), m_State (eSSU2SessionStateUnknown),
 		m_SendPacketNum (0), m_ReceivePacketNum (0), m_LastDatetimeSentPacketNum (0),
 		m_IsDataReceived (false), m_WindowSize (SSU2_MIN_WINDOW_SIZE),
@@ -96,6 +96,8 @@ namespace transport
 			InitNoiseXKState1 (*m_NoiseState, m_Address->s);
 			m_RemoteEndpoint = boost::asio::ip::udp::endpoint (m_Address->host, m_Address->port);
 			m_RemoteTransports = in_RemoteRouter->GetCompatibleTransports (false);
+			if (in_RemoteRouter->IsSSU2PeerTesting (true)) m_RemotePeerTestTransports |= i2p::data::RouterInfo::eSSU2V4;
+			if (in_RemoteRouter->IsSSU2PeerTesting (false)) m_RemotePeerTestTransports |= i2p::data::RouterInfo::eSSU2V6;
 			RAND_bytes ((uint8_t *)&m_DestConnID, 8);
 			RAND_bytes ((uint8_t *)&m_SourceConnID, 8);
 		}
@@ -262,8 +264,10 @@ namespace transport
 			m_SentHandshakePacket.reset (nullptr);
 			m_SessionConfirmedFragment.reset (nullptr);
 			m_PathChallenge.reset (nullptr);
+			for (auto& it: m_SendQueue)
+				it->Drop ();
 			m_SendQueue.clear ();
-			m_SendQueueSize = 0;
+			SetSendQueueSize (0);
 			m_SentPackets.clear ();
 			m_IncompleteMessages.clear ();
 			m_RelaySessions.clear ();
@@ -275,7 +279,7 @@ namespace transport
 			if (remoteIdentity)
 			{
 				LogPrint (eLogDebug, "SSU2: Session with ", GetRemoteEndpoint (),
-					" (", i2p::data::GetIdentHashAbbreviation (GetRemoteIdentity ()->GetIdentHash ()), ") terminated");
+					" (", i2p::data::GetIdentHashAbbreviation (remoteIdentity->GetIdentHash ()), ") terminated");
 			}
 			else
 			{
@@ -349,8 +353,12 @@ namespace transport
 	void SSU2Session::PostI2NPMessages (std::vector<std::shared_ptr<I2NPMessage> > msgs)
 	{
 		if (m_State == eSSU2SessionStateTerminated) return;
+		bool isSemiFull = m_SendQueue.size () > SSU2_MAX_OUTGOING_QUEUE_SIZE/2;
 		for (auto it: msgs)
-			m_SendQueue.push_back (std::move (it));
+			if (isSemiFull && it->onDrop)
+				it->Drop (); // drop earlier because we can handle it
+			else
+				m_SendQueue.push_back (std::move (it));
 		SendQueue ();
 
 		if (m_SendQueue.size () > 0) // windows is full
@@ -364,7 +372,7 @@ namespace transport
 				RequestTermination (eSSU2TerminationReasonTimeout);
 			}
 		}
-		m_SendQueueSize = m_SendQueue.size ();
+		SetSendQueueSize (m_SendQueue.size ());
 	}
 
 	bool SSU2Session::SendQueue ()
@@ -379,8 +387,10 @@ namespace transport
 			while (!m_SendQueue.empty () && m_SentPackets.size () <= m_WindowSize)
 			{
 				auto msg = m_SendQueue.front ();
-				if (!msg)
+				if (!msg || msg->IsExpired (ts))
 				{
+					// drop null or expired message
+					if (msg) msg->Drop ();
 					m_SendQueue.pop_front ();
 					continue;
 				}
@@ -524,7 +534,7 @@ namespace transport
 					LogPrint (eLogInfo, "SSU2: Packet was not Acked after ", it->second->numResends, " attempts. Terminate session");
 					m_SentPackets.clear ();
 					m_SendQueue.clear ();
-					m_SendQueueSize = 0;
+					SetSendQueueSize (0);
 					RequestTermination (eSSU2TerminationReasonTimeout);
 					return resentPackets.size ();
 				}
@@ -1102,6 +1112,10 @@ namespace transport
 		AdjustMaxPayloadSize ();
 		m_Server.AddSessionByRouterHash (shared_from_this ()); // we know remote router now
 		m_RemoteTransports = ri->GetCompatibleTransports (false);
+		m_RemotePeerTestTransports = 0;
+		if (ri->IsSSU2PeerTesting (true)) m_RemotePeerTestTransports |= i2p::data::RouterInfo::eSSU2V4;
+		if (ri->IsSSU2PeerTesting (false)) m_RemotePeerTestTransports |= i2p::data::RouterInfo::eSSU2V6;
+
 		// handle other blocks
 		HandlePayload (decryptedPayload.data () + riSize + 3, decryptedPayload.size () - riSize - 3);
 		Established ();
@@ -1452,8 +1466,7 @@ namespace transport
 		header.ll[1] ^= CreateHeaderMask (m_KeyDataSend + 32, payload + (len + 4));
 		m_Server.Send (header.buf, 16, payload, len + 16, m_RemoteEndpoint);
 		m_SendPacketNum++;
-		m_LastActivityTimestamp = i2p::util::GetSecondsSinceEpoch ();
-		m_NumSentBytes += len + 32;
+		UpdateNumSentBytes (len + 32);
 		return m_SendPacketNum - 1;
 	}
 
@@ -1472,7 +1485,7 @@ namespace transport
 				ResendHandshakePacket (); // assume we receive
 			return;
 		}
-		if (from != m_RemoteEndpoint && !i2p::util::net::IsInReservedRange (from.address ()))
+		if (from != m_RemoteEndpoint && !i2p::transport::transports.IsInReservedRange (from.address ()))
 		{
 			LogPrint (eLogInfo, "SSU2: Remote endpoint update ", m_RemoteEndpoint, "->", from);
 			m_RemoteEndpoint = from;
@@ -1494,8 +1507,7 @@ namespace transport
 			LogPrint (eLogWarning, "SSU2: Data AEAD verification failed ");
 			return;
 		}
-		m_LastActivityTimestamp = i2p::util::GetSecondsSinceEpoch ();
-		m_NumReceivedBytes += len;
+		UpdateNumReceivedBytes (len);
 		if (!packetNum || UpdateReceivePacketNum (packetNum))
 			HandlePayload (payload, payloadSize);
 	}
@@ -1670,10 +1682,12 @@ namespace transport
 					if (m_Server.IsSyncClockFromPeers ())
 					{
 						if (std::abs (offset) > SSU2_CLOCK_THRESHOLD)
-						{
-							LogPrint (eLogWarning, "SSU2: Clock adjusted by ", -offset, " seconds");
-							i2p::util::AdjustTimeOffset (-offset);
-						}
+						{	
+							LogPrint (eLogWarning, "SSU2: Time offset ", offset, " from ", m_RemoteEndpoint);
+							m_Server.AdjustTimeOffset (-offset, GetRemoteIdentity ());
+						}	
+						else
+							m_Server.AdjustTimeOffset (0, nullptr);
 					}
 					else if (std::abs (offset) > SSU2_CLOCK_SKEW)
 					{
@@ -1753,7 +1767,7 @@ namespace transport
 		if (ExtractEndpoint (buf, len, ep))
 		{
 			LogPrint (eLogInfo, "SSU2: Our external address is ", ep);
-			if (!i2p::util::net::IsInReservedRange (ep.address ()))
+			if (!i2p::transport::transports.IsInReservedRange (ep.address ()))
 			{
 				i2p::context.UpdateAddress (ep.address ());
 				// check our port
@@ -2101,7 +2115,7 @@ namespace transport
 		{
 			case 1: // Bob from Alice
 			{
-				auto session = m_Server.GetRandomSession ((buf[12] == 6) ? i2p::data::RouterInfo::eSSU2V4 : i2p::data::RouterInfo::eSSU2V6,
+				auto session = m_Server.GetRandomPeerTestSession ((buf[12] == 6) ? i2p::data::RouterInfo::eSSU2V4 : i2p::data::RouterInfo::eSSU2V6,
 					GetRemoteIdentity ()->GetIdentHash ());
 				if (session) // session with Charlie
 				{
@@ -2172,7 +2186,8 @@ namespace transport
 								std::shared_ptr<const i2p::data::RouterInfo::Address> addr;
 								if (ExtractEndpoint (buf + offset + 10, asz, ep))
 									addr = r->GetSSU2Address (ep.address ().is_v4 ());
-								if (addr && m_Server.IsSupported (ep.address ()))
+								if (addr && m_Server.IsSupported (ep.address ()) && 
+								    i2p::context.GetRouterInfo ().IsSSU2PeerTesting (ep.address ().is_v4 ()))
 								{
 									// send msg 5 to Alice
 									auto session = std::make_shared<SSU2Session> (m_Server, r, addr);
@@ -2272,7 +2287,7 @@ namespace transport
 										if (GetTestingState ())
 										{
 											SetTestingState (false);
-											if (GetRouterStatus () != eRouterStatusFirewalled)
+											if (GetRouterStatus () != eRouterStatusFirewalled && addr->IsPeerTesting ())
 											{
 												SetRouterStatus (eRouterStatusFirewalled);
 												if (m_Address->IsV4 ())
@@ -2357,7 +2372,7 @@ namespace transport
 		if (!msg->IsExpired ())
 		{
 			// m_LastActivityTimestamp is updated in ProcessData before
-			if (m_ReceivedI2NPMsgIDs.emplace (msgID, (uint32_t)m_LastActivityTimestamp).second)
+			if (m_ReceivedI2NPMsgIDs.emplace (msgID, (uint32_t)GetLastActivityTimestamp ()).second)
 				m_Handler.PutNextMessage (std::move (msg));
 			else
 				LogPrint (eLogDebug, "SSU2: Message ", msgID, " already received");
@@ -2483,6 +2498,8 @@ namespace transport
 			else if (m_Address->IsV6 ())
 				i2p::context.SetTestingV6 (testing);
 		}
+		if (!testing)
+			m_Server.AdjustTimeOffset (0, nullptr); // reset time offset when testing is over
 	}
 
 	size_t SSU2Session::CreateAddressBlock (uint8_t * buf, size_t len, const boost::asio::ip::udp::endpoint& ep)
@@ -2943,7 +2960,7 @@ namespace transport
 			else
 				++it;
 		}
-		if (m_ReceivedI2NPMsgIDs.size () > SSU2_MAX_NUM_RECEIVED_I2NP_MSGIDS || ts > m_LastActivityTimestamp + SSU2_DECAY_INTERVAL)
+		if (m_ReceivedI2NPMsgIDs.size () > SSU2_MAX_NUM_RECEIVED_I2NP_MSGIDS || ts > GetLastActivityTimestamp () + SSU2_DECAY_INTERVAL)
 			// decay
 			m_ReceivedI2NPMsgIDs.clear ();
 		else
@@ -3015,7 +3032,7 @@ namespace transport
 	{
 		bool sent = SendQueue (); // if we have something to send
 		if (sent)
-			m_SendQueueSize = m_SendQueue.size ();
+			SetSendQueueSize (m_SendQueue.size ());
 		if (m_IsDataReceived)
 		{
 			if (!sent) SendQuickAck ();

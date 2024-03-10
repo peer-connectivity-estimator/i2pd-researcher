@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2013-2023, The PurpleI2P Project
+* Copyright (c) 2013-2024, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
@@ -31,11 +31,11 @@ namespace data
 	const char PEER_PROFILE_USAGE_CONNECTED[] = "connected";
 	
 	const int PEER_PROFILE_EXPIRATION_TIMEOUT = 36; // in hours (1.5 days)
-	const int PEER_PROFILE_AUTOCLEAN_TIMEOUT = 6 * 3600; // in seconds (6 hours)
+	const int PEER_PROFILE_AUTOCLEAN_TIMEOUT = 3 * 3600; // in seconds (3 hours)
 	const int PEER_PROFILE_AUTOCLEAN_VARIANCE = 3600; // in seconds (1 hour)
 	const int PEER_PROFILE_DECLINED_RECENTLY_INTERVAL = 150; // in seconds (2.5 minutes)
 	const int PEER_PROFILE_PERSIST_INTERVAL = 3300; // in seconds (55 minutes)
-	const int PEER_PROFILE_UNREACHABLE_INTERVAL = 2*3600; // on seconds (2 hours)
+	const int PEER_PROFILE_UNREACHABLE_INTERVAL = 480; // in seconds (8 minutes)
 	const int PEER_PROFILE_USEFUL_THRESHOLD = 3;
 
 	class RouterProfile
@@ -43,7 +43,6 @@ namespace data
 		public:
 
 			RouterProfile ();
-			RouterProfile& operator= (const RouterProfile& ) = default;
 
 			void Save (const IdentHash& identHash);
 			void Load (const IdentHash& identHash);
@@ -88,6 +87,7 @@ namespace data
 	};
 
 	std::shared_ptr<RouterProfile> GetRouterProfile (const IdentHash& identHash);
+	bool IsRouterBanned (const IdentHash& identHash); // check only existing profiles
 	void InitProfilesStorage ();
 	void DeleteObsoleteProfiles ();
 	void SaveProfiles ();

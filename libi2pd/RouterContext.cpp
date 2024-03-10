@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2013-2023, The PurpleI2P Project
+* Copyright (c) 2013-2024, The PurpleI2P Project
 *
 * This file is part of Purple i2pd project and licensed under BSD3
 *
@@ -40,7 +40,7 @@ namespace i2p
 	void RouterContext::Init ()
 	{
 		srand (i2p::util::GetMillisecondsSinceEpoch () % 1000);
-		m_StartupTime = std::chrono::steady_clock::now();
+		m_StartupTime = i2p::util::GetMonotonicSeconds ();
 
 		if (!Load ())
 			CreateNewRouter ();
@@ -61,9 +61,11 @@ namespace i2p
 			{
 				m_PublishTimer.reset (new boost::asio::deadline_timer (m_Service->GetService ()));
 				ScheduleInitialPublish ();
-				m_CongestionUpdateTimer.reset (new boost::asio::deadline_timer (m_Service->GetService ()));
-				ScheduleCongestionUpdate ();
 			}	
+			m_CongestionUpdateTimer.reset (new boost::asio::deadline_timer (m_Service->GetService ()));
+			ScheduleCongestionUpdate ();
+			m_CleanupTimer.reset (new boost::asio::deadline_timer (m_Service->GetService ()));
+			ScheduleCleanupTimer ();
 		}	
 	}
 	
@@ -303,6 +305,8 @@ namespace i2p
 		SetTesting (false);
 		if (status != m_Status)
 		{
+			LogPrint(eLogInfo, "Router: network status v4 changed ",
+				ROUTER_STATUS_NAMES[m_Status], " -> ", ROUTER_STATUS_NAMES[status]);
 			m_Status = status;
 			switch (m_Status)
 			{
@@ -323,6 +327,8 @@ namespace i2p
 		SetTestingV6 (false);
 		if (status != m_StatusV6)
 		{
+			LogPrint(eLogInfo, "Router: network status v6 changed ",
+				ROUTER_STATUS_NAMES[m_StatusV6], " -> ", ROUTER_STATUS_NAMES[status]);
 			m_StatusV6 = status;
 			switch (m_StatusV6)
 			{
@@ -594,15 +600,15 @@ namespace i2p
 		/* detect parameters */
 		switch (L)
 		{
-			case i2p::data::CAPS_FLAG_LOW_BANDWIDTH1   : limit =   12; type = low;   break;
-			case i2p::data::CAPS_FLAG_LOW_BANDWIDTH2   : limit =   48; type = low;   break;
-			case i2p::data::CAPS_FLAG_HIGH_BANDWIDTH1  : limit =   64; type = high;  break;
-			case i2p::data::CAPS_FLAG_HIGH_BANDWIDTH2  : limit =  128; type = high;  break;
-			case i2p::data::CAPS_FLAG_HIGH_BANDWIDTH3  : limit =  256; type = high;  break;
-			case i2p::data::CAPS_FLAG_EXTRA_BANDWIDTH1 : limit = 2048; type = extra; break;
+			case i2p::data::CAPS_FLAG_LOW_BANDWIDTH1   : limit = 12; type = low;   break;
+			case i2p::data::CAPS_FLAG_LOW_BANDWIDTH2   : limit = i2p::data::LOW_BANDWIDTH_LIMIT; type = low;   break; // 48
+			case i2p::data::CAPS_FLAG_LOW_BANDWIDTH3  : limit = 64; type = low;  break;
+			case i2p::data::CAPS_FLAG_HIGH_BANDWIDTH1  : limit = 128; type = high;  break;
+			case i2p::data::CAPS_FLAG_HIGH_BANDWIDTH2  : limit = i2p::data::HIGH_BANDWIDTH_LIMIT; type = high;  break; // 256
+			case i2p::data::CAPS_FLAG_EXTRA_BANDWIDTH1 : limit = i2p::data::EXTRA_BANDWIDTH_LIMIT; type = extra; break; // 2048
 			case i2p::data::CAPS_FLAG_EXTRA_BANDWIDTH2 : limit = 1000000; type = unlim; break; // 1Gbyte/s
 			default:
-				limit = 48; type = low;
+				limit = i2p::data::LOW_BANDWIDTH_LIMIT; type = low; // 48
 		}
 		/* update caps & flags in RI */
 		auto caps = m_RouterInfo.GetCaps ();
@@ -1131,13 +1137,14 @@ namespace i2p
 		return i2p::tunnel::tunnels.GetExploratoryPool ();
 	}
 
-	bool RouterContext::IsHighCongestion () const
+	int RouterContext::GetCongestionLevel (bool longTerm) const
 	{
-		return i2p::tunnel::tunnels.IsTooManyTransitTunnels () ||
-			i2p::transport::transports.IsBandwidthExceeded () ||
-			i2p::transport::transports.IsTransitBandwidthExceeded ();
-	}	
-		
+		return std::max (
+			i2p::tunnel::tunnels.GetCongestionLevel (),
+			i2p::transport::transports.GetCongestionLevel (longTerm)
+		);
+	}
+	
 	void RouterContext::HandleI2NPMessage (const uint8_t * buf, size_t len)
 	{
 		i2p::HandleI2NPMessage (CreateI2NPMessage (buf, GetI2NPMessageLength (buf, len)));
@@ -1145,6 +1152,13 @@ namespace i2p
 
 	bool RouterContext::HandleCloveI2NPMessage (I2NPMessageType typeID, const uint8_t * payload, size_t len, uint32_t msgID)
 	{
+		if (typeID == eI2NPTunnelTest)
+		{
+			// try tunnel test
+			auto pool = GetTunnelPool ();
+			if (pool && pool->ProcessTunnelTest (bufbe32toh (payload + TUNNEL_TEST_MSGID_OFFSET), bufbe64toh (payload + TUNNEL_TEST_TIMESTAMP_OFFSET)))
+				return true;
+		}
 		auto msg = CreateI2NPMessage (typeID, payload, len, msgID);
 		if (!msg) return false;
 		i2p::HandleI2NPMessage (msg);
@@ -1199,21 +1213,30 @@ namespace i2p
 		else	              
 			i2p::garlic::GarlicDestination::ProcessDeliveryStatusMessage (msg);
 	}
-	
-	void RouterContext::CleanupDestination ()
+
+	void RouterContext::SubmitECIESx25519Key (const uint8_t * key, uint64_t tag)
 	{
 		if (m_Service)
-			m_Service->GetService ().post ([this]()
-			{  
-				this->i2p::garlic::GarlicDestination::CleanupExpiredTags ();
-			});	
+		{
+			struct
+			{
+				uint8_t k[32];
+				uint64_t t;
+			} data;
+			memcpy (data.k, key, 32);
+			data.t = tag;
+			m_Service->GetService ().post ([this,data](void)
+				{
+					AddECIESx25519Key (data.k, data.t);
+				});
+		}	
 		else
 			LogPrint (eLogError, "Router: service is NULL");
-	}
+	}	
 
 	uint32_t RouterContext::GetUptime () const
 	{
-		return std::chrono::duration_cast<std::chrono::seconds> (std::chrono::steady_clock::now() - m_StartupTime).count ();
+		return i2p::util::GetMonotonicSeconds () - m_StartupTime;
 	}
 
 	bool RouterContext::Decrypt (const uint8_t * encrypted, uint8_t * data, i2p::data::CryptoKeyType preferredCrypto) const
@@ -1354,10 +1377,19 @@ namespace i2p
 			uint32_t replyToken;
 			RAND_bytes ((uint8_t *)&replyToken, 4);
 			LogPrint (eLogInfo, "Router: Publishing our RouterInfo to ", i2p::data::GetIdentHashAbbreviation(floodfill->GetIdentHash ()), ". reply token=", replyToken);
+			auto onDrop = [this]()
+				{
+					if (m_Service)
+						m_Service->GetService ().post ([this]() { HandlePublishResendTimer (boost::system::error_code ()); });
+				};
 			if (floodfill->IsReachableFrom (i2p::context.GetRouterInfo ()) || // are we able to connect?
 				i2p::transport::transports.IsConnected (floodfill->GetIdentHash ())) // already connected ?
+			{	
 				// send directly
-				i2p::transport::transports.SendMessage (floodfill->GetIdentHash (), CreateDatabaseStoreMsg (i2p::context.GetSharedRouterInfo (), replyToken));
+				auto msg = CreateDatabaseStoreMsg (i2p::context.GetSharedRouterInfo (), replyToken);
+				msg->onDrop = onDrop;
+				i2p::transport::transports.SendMessage (floodfill->GetIdentHash (), msg);
+			}	
 			else
 			{
 				// otherwise through exploratory
@@ -1368,6 +1400,7 @@ namespace i2p
 				{		
 					// encrypt for floodfill
 					auto msg = CreateDatabaseStoreMsg (i2p::context.GetSharedRouterInfo (), replyToken, inbound);
+					msg->onDrop = onDrop;
 					outbound->SendTunnelDataMsgTo (floodfill->GetIdentHash (), 0, 
 						i2p::garlic::WrapECIESX25519MessageForRouter (msg, floodfill->GetIdentity ()->GetEncryptionPublicKey ()));
 				}	
@@ -1422,13 +1455,41 @@ namespace i2p
 		if (ecode != boost::asio::error::operation_aborted)
 		{
 			auto c = i2p::data::RouterInfo::eLowCongestion;
-			if (!AcceptsTunnels ()) 
+			if (!AcceptsTunnels () || !m_ShareRatio)
 				c = i2p::data::RouterInfo::eRejectAll;
-			else if (IsHighCongestion ()) 
-				c = i2p::data::RouterInfo::eHighCongestion;
+			else
+			{
+				int congestionLevel = GetCongestionLevel (true);
+				if (congestionLevel > CONGESTION_LEVEL_HIGH)
+					c = i2p::data::RouterInfo::eHighCongestion;
+				else if (congestionLevel > CONGESTION_LEVEL_MEDIUM)
+					c = i2p::data::RouterInfo::eMediumCongestion;
+			}
 			if (m_RouterInfo.UpdateCongestion (c))
 				UpdateRouterInfo ();
 			ScheduleCongestionUpdate ();
+		}	
+	}	
+
+	void RouterContext::ScheduleCleanupTimer ()
+	{
+		if (m_CleanupTimer)
+		{	
+			m_CleanupTimer->cancel ();
+			m_CleanupTimer->expires_from_now (boost::posix_time::minutes(ROUTER_INFO_CLEANUP_INTERVAL));
+			m_CleanupTimer->async_wait (std::bind (&RouterContext::HandleCleanupTimer,
+				this, std::placeholders::_1));
+		}	
+		else
+			LogPrint (eLogError, "Router: Cleanup timer is NULL");
+	}	
+
+	void RouterContext::HandleCleanupTimer (const boost::system::error_code& ecode)
+	{
+		if (ecode != boost::asio::error::operation_aborted)
+		{
+			CleanupExpiredTags ();
+			ScheduleCleanupTimer ();
 		}	
 	}	
 }
